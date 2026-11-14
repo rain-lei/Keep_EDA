@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="xyz.keepeda.sensors" android:versionCode="2" android:versionName="1.1">
+    <queries><package android:name="com.gotokeep.keep"/></queries>
+    <application android:label="Keep 计步窗口" android:allowBackup="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".Viewer" android:exported="true" android:screenOrientation="portrait" android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden"/>
+    </application>
+    <instrumentation android:name=".Controller" android:targetPackage="xyz.keepeda.sensors"/>
+</manifest>

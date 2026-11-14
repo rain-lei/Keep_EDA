@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+.firecrawl/
+build/
+dist/
+*.spec
+
+# Desktop builds are distributed as release assets.
+*.exe
+
+# Personal test captures and application state stay local.
+样例/*.png
+settings.json
+last-live-*.json
+*.sqlite3
+*.sqlite3-*
+*.log
+.env
+.env.*
+*.jks
+*.keystore
+*.pem
+*.key
