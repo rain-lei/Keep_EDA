@@ -1,6 +1,7 @@
 """Connect the selected LDPlayer instance to Android 14's virtual running sensors."""
 
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 import re
 import socket
@@ -39,7 +40,7 @@ class VirtualPedometer:
             sock = socket.create_connection(("127.0.0.1", port), timeout=1.5)
             reader = sock.makefile("rb")
             banner = reader.readline(64).strip()
-            match = re.fullmatch(rb"EDA([12]) ([1-9]\d*)", banner)
+            match = re.fullmatch(rb"EDA([123]) ([1-9]\d*)", banner)
             if match:
                 return cls(device, index, port, sock, reader, int(match[2]), int(match[1]))
         except (OSError, ValueError, DeviceError):
@@ -96,6 +97,13 @@ class VirtualPedometer:
     def begin(self, steps: int):
         self._send(f"BEGIN {steps}", ack=True)
 
+    def orient(self, heading: float, *, immediate=False):
+        if self.version < 3:
+            raise DeviceError("当前计步窗口缺少方向传感器。请关闭雷电里的旧计步窗口，再从新版控制台重新打开。")
+        if not isfinite(heading):
+            raise ValueError("朝向必须是有限角度。")
+        self._send(f"HEADING {heading % 360:.6f} {int(immediate)}", ack=True)
+
     def sample(self, motion: Motion, *, essential=True):
         self.active = True
         self._send(f"S {motion.footfalls:.8f} {motion.cadence:.6f} {motion.step_length:.6f}")
@@ -118,7 +126,7 @@ class VirtualPedometer:
             self._remove_forward(self.device, self.index, self.port)
 
 
-def open_step_viewer(device: LDPlayer, index: int, cancel) -> str:
+def open_step_viewer(device: LDPlayer, index: int, cancel, *, heading: float | None = None) -> str:
     def adb(command: str, timeout=10):
         return device.command("adb", "--index", str(index), "--command", command, timeout=timeout)
 
@@ -129,7 +137,11 @@ def open_step_viewer(device: LDPlayer, index: int, cancel) -> str:
     existing = VirtualPedometer.connect(device, index)
     if existing:
         display = existing.display_id
-        existing.close()
+        try:
+            if heading is not None:
+                existing.orient(heading, immediate=True)
+        finally:
+            existing.close()
         adb(f"shell am start --display 0 --activity-single-top -n {PACKAGE}/.Viewer")
         tasks = adb("shell dumpsys activity activities")
         section = re.search(rf"(?ms)^Display #{display} \(activities[^\n]*\n(.*?)(?=^Display #|\n\s*ResumedActivity:|\n\s*ActivityTaskSupervisor state:|\Z)", tasks)
@@ -180,7 +192,11 @@ def open_step_viewer(device: LDPlayer, index: int, cancel) -> str:
         while not cancel.is_set() and time.monotonic() < deadline:
             bridge = VirtualPedometer.connect(device, index)
             if bridge:
-                bridge.close()
+                try:
+                    if heading is not None:
+                        bridge.orient(heading, immediate=True)
+                finally:
+                    bridge.close()
                 return "Android 计步窗口已就绪。在这个窗口内进入 Keep 户外跑步。"
             if runner.poll() is not None:
                 break
@@ -195,3 +211,15 @@ def open_step_viewer(device: LDPlayer, index: int, cancel) -> str:
         except DeviceError:
             pass
         raise
+
+
+def orient_step_viewer(device: LDPlayer, index: int, heading: float) -> bool:
+    """Align an already open viewer when the user repositions a random start."""
+    bridge = VirtualPedometer.connect(device, index)
+    if bridge is None:
+        return False
+    try:
+        bridge.orient(heading, immediate=True)
+    finally:
+        bridge.close()
+    return True

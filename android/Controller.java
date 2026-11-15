@@ -42,6 +42,7 @@ public final class Controller extends Instrumentation {
     private long total, base, lastFrame, lastIdle;
     private int limit;
     private double phase, cadence, length;
+    private final Heading heading = new Heading();
 
     @Override public void onCreate(Bundle args) {
         super.onCreate(args);
@@ -150,7 +151,7 @@ public final class Controller extends Instrumentation {
                     client = socket;
                     BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
                     PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-                    out.println("EDA2 " + displayId);
+                    out.println("EDA3 " + displayId);
                     for (String line; (line = in.readLine()) != null;) {
                         if (line.length() > 180) break;
                         if (line.equals("CLOSE")) { requestClose(); break; }
@@ -175,6 +176,11 @@ public final class Controller extends Instrumentation {
     private synchronized boolean command(String line) throws Exception {
         String[] fields = line.split(" ");
         switch (fields[0]) {
+            case "HEADING":
+                if (fields.length != 3 || !(fields[2].equals("0") || fields[2].equals("1")))
+                    throw new IllegalArgumentException("heading");
+                heading.set(Double.parseDouble(fields[1]), fields[2].equals("1"));
+                return true;
             case "BEGIN":
                 limit = Integer.parseInt(fields[1]);
                 if (limit < 0 || limit > 300000) throw new IllegalArgumentException("steps");
@@ -191,7 +197,7 @@ public final class Controller extends Instrumentation {
                 return false;
             case "REST":
                 running = false;
-                sensors.send(Sensor.TYPE_ACCELEROMETER, 0, 9.81f, 0);
+                sensors.send(Sensor.TYPE_ACCELEROMETER, heading.gravity());
                 return true;
             case "END":
                 running = false;
@@ -215,22 +221,19 @@ public final class Controller extends Instrumentation {
 
     private synchronized void tick() throws Exception {
         long now = SystemClock.elapsedRealtimeNanos();
+        heading.tick(now);
+        sensors.orient(heading);
         double age = (now-lastFrame)*1e-9;
         if (!running || age > .28) {
             if (now-lastIdle > 400000000L) {
-                sensors.send(Sensor.TYPE_ACCELEROMETER, 0, 9.81f, 0);
+                sensors.send(Sensor.TYPE_ACCELEROMETER, heading.gravity());
                 sensors.counter(total);
                 lastIdle = now;
             }
             return;
         }
         double foot = Math.min(limit + .49, phase + age*cadence/60);
-        double angle = 2*Math.PI*(foot-.5);
-        double impact = Math.min(6, Math.max(3.6, 4.8*Math.pow(length,.35)));
-        double gain = Math.min(1, foot);
-        sensors.send(Sensor.TYPE_ACCELEROMETER, (float)(gain*1.65*Math.sin(Math.PI*foot)),
-            (float)(9.81 + gain*impact*(Math.cos(angle)+.24*Math.cos(2*angle))),
-            (float)(gain*(2*Math.sin(angle)-.45*Math.sin(2*angle))));
+        sensors.send(Sensor.TYPE_ACCELEROMETER, heading.gait(foot, length));
         stepsTo((int)Math.floor(foot+.5));
     }
 }

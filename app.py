@@ -22,7 +22,7 @@ from ldplayer import LDPlayer, console_at, find_console
 from live_history import LastReplay
 from playback import PlaybackControl, Sample, replay, replay_on_device
 from route_view import FONT, GREEN, INK, RouteView
-from sensor_bridge import open_step_viewer
+from sensor_bridge import open_step_viewer, orient_step_viewer
 
 
 BACKGROUND, PAPER, LIGHT, MUTED = "#f4f6f2", "#ffffff", "#eaf0e9", "#536a5e"
@@ -277,7 +277,8 @@ class Dashboard:
 
     def reset_metrics(self) -> None:
         start = self.track.start_point(self.plan) if self.plan else self.map.start
-        self.sample(Sample(0, 0, start))
+        heading = self.track.travel_path(self.plan).heading_at(0) if self.plan else None
+        self.sample(Sample(0, 0, start, heading=heading))
 
     def sample(self, sample: Sample) -> None:
         self.distance = sample.meters
@@ -292,7 +293,8 @@ class Dashboard:
         else:
             self.gait_info.set("")
         self.progress["value"] = 100 * sample.meters / self.plan.meters if self.plan else 0
-        self.map.set_position(sample.point, self.direction.get() == "顺时针", reset=sample.seconds == 0)
+        self.map.set_position(sample.point, self.direction.get() == "顺时针",
+                              reset=sample.seconds == 0, heading=sample.heading)
 
     def update_controls(self) -> None:
         idle = not self.job
@@ -412,6 +414,7 @@ class Dashboard:
     def device_action(self, kind: str) -> None:
         device, index = LDPlayer(self.console), self.selected_index
         start = self.track.start_point(self.plan) if self.plan else None
+        heading = self.track.travel_path(self.plan).heading_at(0) if self.plan else None
         check_motion = self.motion_enabled.get()
 
         def action(control):
@@ -421,7 +424,7 @@ class Dashboard:
             if kind == "keep":
                 if check_motion:
                     with device.reserve_location(index):
-                        return open_step_viewer(device, index, control.cancel)
+                        return open_step_viewer(device, index, control.cancel, heading=heading)
                 return device.open_keep(index)
             if kind == "permissions":
                 return device.open_keep_permissions(index)
@@ -430,7 +433,9 @@ class Dashboard:
             with device.reserve_location(index):
                 device.check_location(index)
                 device.locate(index, start)
-            self.events.put(("sample", Sample(0, 0, start)))
+                if check_motion:
+                    orient_step_viewer(device, index, heading)
+            self.events.put(("sample", Sample(0, 0, start, heading=heading)))
             hint = (PERMISSION_HINT if check_motion and device.keep_activity_permission(index) is False
                     else "点击「实时回放」待命，再在 Keep 中开始户外跑步。")
             return f"已定位到{self.track.name}起点。{hint}"

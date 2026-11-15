@@ -1,5 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="xyz.keepeda.sensors" android:versionCode="2" android:versionName="1.1">
+    package="xyz.keepeda.sensors" android:versionCode="3" android:versionName="1.2">
     <queries><package android:name="com.gotokeep.keep"/></queries>
     <application android:label="Keep 计步窗口" android:allowBackup="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

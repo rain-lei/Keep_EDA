@@ -121,6 +121,7 @@ class Sample:
     motion_sent: bool = False
     activity_allowed: bool | None = None
     virtual_steps: bool = False
+    heading: float | None = None
 
 
 def replay(track: CampusTrack, plan: RunPlan, control: PlaybackControl, send: Callable[[Sample], None],
@@ -135,7 +136,8 @@ def replay(track: CampusTrack, plan: RunPlan, control: PlaybackControl, send: Ca
     if start_clock:
         control.resume()
     first = pacing.at(0)
-    send(Sample(0.0, 0.0, path.points[0], first.speed, first.cadence, 0, sensor is not None))
+    send(Sample(0.0, 0.0, path.points[0], first.speed, first.cadence, 0, sensor is not None,
+                heading=path.heading_at(0)))
     duration = plan.duration / speedup
     next_gps = min(interval, duration)
     quarter = 1
@@ -153,7 +155,7 @@ def replay(track: CampusTrack, plan: RunPlan, control: PlaybackControl, send: Ca
         motion = pacing.at(seconds)
         if finished or played+1e-8 >= next_gps:
             send(Sample(seconds, motion.meters, path.at(motion.meters), motion.speed, motion.cadence,
-                        motion.steps, sensor is not None))
+                        motion.steps, sensor is not None, heading=path.heading_at(motion.meters)))
             if finished:
                 return not control.cancel.is_set()
             next_gps = (floor((played+1e-8)/interval) + 1) * interval
@@ -183,6 +185,8 @@ def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl
             check_running()
             next_check = sample.seconds + 5
         device.locate(index, sample.point)
+        if bridge:
+            bridge.orient(sample.heading, immediate=sample.seconds == 0)
         control.note_location(sample)
         monitor.positioned()
         report(replace(sample, motion_sent=sensor is not None, activity_allowed=allowed, virtual_steps=bridge is not None))
@@ -202,6 +206,8 @@ def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl
                 control.note_virtual_steps(steps)
             monitor.stepped()
         try:
+            if bridge:
+                bridge.orient(track.travel_path(plan).heading_at(0), immediate=True)
             if link_keep:
                 if bridge is None:
                     raise DeviceError("起停联动需要先打开 Keep 计步窗口。")

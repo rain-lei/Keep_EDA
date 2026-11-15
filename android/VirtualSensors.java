@@ -17,6 +17,9 @@ import java.util.concurrent.Executor;
 /** Android 14's virtual-device System APIs, which aren't in the public SDK jar. */
 final class VirtualSensors implements AutoCloseable {
     private static final String PREFIX = "android.companion.virtual.";
+    private static final int[] TYPES = {Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_STEP_DETECTOR,
+        Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_GRAVITY,
+        Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR, Sensor.TYPE_ORIENTATION};
     private final Object device;
     private final Map<Integer, Object> sensors = new HashMap<>();
     private final Constructor<?> eventBuilder;
@@ -35,15 +38,26 @@ final class VirtualSensors implements AutoCloseable {
         Executor direct = Runnable::run;
         builder.getMethod("setVirtualSensorCallback", Executor.class, callbackType).invoke(params, direct, callback);
         Class<?> config = Class.forName(configType.getName() + "$Builder");
-        for (int type : new int[]{Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_STEP_DETECTOR, Sensor.TYPE_STEP_COUNTER}) {
-            String name = type == Sensor.TYPE_ACCELEROMETER ? "Accelerometer"
-                          : type == Sensor.TYPE_STEP_COUNTER ? "Step Counter" : "Step Detector";
+        for (int type : TYPES) {
+            String name;
+            float range, resolution = .01f;
+            boolean steps = type == Sensor.TYPE_STEP_COUNTER || type == Sensor.TYPE_STEP_DETECTOR;
+            switch (type) {
+                case Sensor.TYPE_ACCELEROMETER: name = "Accelerometer"; range = 40; break;
+                case Sensor.TYPE_STEP_COUNTER: name = "Step Counter"; range = 16777216; resolution = 1; break;
+                case Sensor.TYPE_STEP_DETECTOR: name = "Step Detector"; range = 1; resolution = 1; break;
+                case Sensor.TYPE_MAGNETIC_FIELD: name = "Magnetic Field"; range = 200; break;
+                case Sensor.TYPE_GRAVITY: name = "Gravity"; range = 20; break;
+                case Sensor.TYPE_ORIENTATION: name = "Orientation"; range = 360; break;
+                case Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR: name = "Geomagnetic Rotation"; range = 1; resolution = .00001f; break;
+                default: name = "Rotation Vector"; range = 1; resolution = .00001f;
+            }
             Object sensor = config.getConstructor(int.class, String.class).newInstance(type, "Keep EDA " + name);
             config.getMethod("setVendor", String.class).invoke(sensor, "Keep EDA");
-            config.getMethod("setMinDelay", int.class).invoke(sensor, type == Sensor.TYPE_ACCELEROMETER ? 10000 : 0);
+            config.getMethod("setMinDelay", int.class).invoke(sensor, steps ? 0 : 10000);
             config.getMethod("setMaxDelay", int.class).invoke(sensor, 200000);
-            config.getMethod("setMaximumRange", float.class).invoke(sensor, type == Sensor.TYPE_ACCELEROMETER ? 40f : 16777216f);
-            config.getMethod("setResolution", float.class).invoke(sensor, type == Sensor.TYPE_ACCELEROMETER ? .01f : 1f);
+            config.getMethod("setMaximumRange", float.class).invoke(sensor, range);
+            config.getMethod("setResolution", float.class).invoke(sensor, resolution);
             builder.getMethod("addVirtualSensorConfig", configType).invoke(params, config.getMethod("build").invoke(sensor));
         }
         Class<?> eb = Class.forName(PREFIX + "sensor.VirtualSensorEvent$Builder");
@@ -61,7 +75,7 @@ final class VirtualSensors implements AutoCloseable {
             for (Object sensor : (List<?>) deviceType.getMethod("getVirtualSensorList").invoke(device)) {
                 sensors.put((Integer) sensorType.getMethod("getType").invoke(sensor), sensor);
             }
-            if (sensors.size() != 3) throw new IllegalStateException("Android 未创建全部跑步传感器");
+            if (sensors.size() != TYPES.length) throw new IllegalStateException("Android 未创建全部跑步和方向传感器");
         } catch (Exception error) {
             close();
             throw error;
@@ -86,6 +100,14 @@ final class VirtualSensors implements AutoCloseable {
         // Android 14 copies float array storage into sensors_event_t. The step
         // counter is the uint64 member of that union, including its high word.
         send(Sensor.TYPE_STEP_COUNTER, Float.intBitsToFloat((int) count), Float.intBitsToFloat((int)(count >>> 32)));
+    }
+
+    void orient(Heading heading) throws Exception {
+        send(Sensor.TYPE_GRAVITY, heading.gravity());
+        send(Sensor.TYPE_MAGNETIC_FIELD, heading.magnetic());
+        send(Sensor.TYPE_ROTATION_VECTOR, heading.rotation());
+        send(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR, heading.rotation());
+        send(Sensor.TYPE_ORIENTATION, heading.orientation());
     }
 
     @Override public void close() throws Exception {

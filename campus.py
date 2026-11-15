@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 from functools import cached_property, lru_cache
 from itertools import accumulate, pairwise
 import json
-from math import asin, ceil, cos, hypot, radians, sin, sqrt
+from math import asin, atan2, ceil, cos, degrees, hypot, radians, sin, sqrt
 from pathlib import Path
 from random import Random
 import re
@@ -27,6 +27,15 @@ def distance_m(first: Point, second: Point) -> float:
     return 12_742_017.6 * asin(min(1.0, sqrt(a)))
 
 
+def bearing_degrees(first: Point, second: Point) -> float:
+    """Forward bearing: north is 0 degrees, east is 90, clockwise positive."""
+    lon1, lat1 = map(radians, first)
+    lon2, lat2 = map(radians, second)
+    east = sin(lon2-lon1)*cos(lat2)
+    north = cos(lat1)*sin(lat2)-sin(lat1)*cos(lat2)*cos(lon2-lon1)
+    return degrees(atan2(east, north)) % 360
+
+
 class Line:
     def __init__(self, points):
         self.points = tuple(points)
@@ -40,6 +49,16 @@ class Line:
         lon1, lat1 = self.points[segment]
         lon2, lat2 = self.points[segment + 1]
         return lon1 + fraction * (lon2 - lon1), lat1 + fraction * (lat2 - lat1)
+
+    def heading_at(self, distance: float) -> float:
+        """A six-metre tangent smooths mapped corners without sampling UI frames."""
+        offset = min(self.length, max(0.0, distance))
+        before, after = self.at(offset-3), self.at(offset+3)
+        if distance_m(before, after) < 1e-4:
+            # At a hairpin, opposing tangents can cancel. Keep the outgoing leg.
+            segment = min(bisect_right(self.offsets, offset)-1, len(self.points)-2)
+            before, after = self.points[segment:segment+2]
+        return bearing_degrees(before, after)
 
 
 class CampusTrack(Line):

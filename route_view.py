@@ -1,6 +1,6 @@
 """Offline map drawn from the bundled OpenStreetMap geometry."""
 
-from math import cos, radians
+from math import cos, radians, sin
 from collections import deque
 import tkinter as tk
 
@@ -25,6 +25,7 @@ class RouteView(tk.Canvas):
     def set_track(self, track: CampusTrack) -> None:
         self.track = track
         self.current = track.points[0]
+        self.heading = 0.0
         self.start = self.current
         self.trail.clear()
         xs, ys = zip(*track.points)
@@ -93,8 +94,10 @@ class RouteView(tk.Canvas):
                          font=("Segoe UI", 8), fill="#4c6254")
         self.draw_position()
 
-    def set_position(self, point: Point, clockwise: bool, *, reset=False) -> None:
+    def set_position(self, point: Point, clockwise: bool, *, reset=False, heading: float | None = None) -> None:
         self.current, self.clockwise = point, clockwise
+        if heading is not None:
+            self.heading = heading % 360
         if reset:
             self.trail.clear()
             self.start = point
@@ -112,10 +115,9 @@ class RouteView(tk.Canvas):
                          outline=GREEN, width=2, tags="position")
         self.create_text(start_x-13, start_y, anchor="e", text="起点", font=(FONT, 9, "bold"),
                          fill=INK, tags="position")
-        # A small arrow on the straight shows the selected direction, even at rest.
-        arrow_at = self.track.length * (0.49 if not self.clockwise else 0.51)
-        a = self.project(self.track.position(arrow_at, self.clockwise))
-        b = self.project(self.track.position(arrow_at + 7, self.clockwise))
-        self.create_line(*a, *b, arrow="last", arrowshape=(9, 9, 4), fill=GREEN, width=3, tags="position")
         x, y = self.project(self.current)
-        self.create_oval(x-7, y-7, x+7, y+7, fill=GREEN, outline="white", width=3, tags="position")
+        angle = radians(self.heading)
+        points = [(0, -12), (8, 9), (0, 5), (-8, 9)]
+        arrow = [coordinate for dx, dy in points
+                 for coordinate in (x+dx*cos(angle)-dy*sin(angle), y+dx*sin(angle)+dy*cos(angle))]
+        self.create_polygon(arrow, fill=GREEN, outline="white", width=2, tags=("position", "heading"))
