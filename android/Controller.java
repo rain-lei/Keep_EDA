@@ -151,12 +151,12 @@ public final class Controller extends Instrumentation {
                     client = socket;
                     BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
                     PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-                    out.println("EDA3 " + displayId);
+                    out.println("EDA4 " + displayId);
                     for (String line; (line = in.readLine()) != null;) {
                         if (line.length() > 180) break;
                         if (line.equals("CLOSE")) { requestClose(); break; }
                         if (line.equals("STATE")) { out.println(keepUi.state()); continue; }
-                        if (line.startsWith("ACTION ")) { keepUi.request(line.substring(7)); out.println("OK"); continue; }
+                        if (line.startsWith("ACTION ")) { out.println(keepUi.request(line.substring(7))); continue; }
                         if (command(line)) out.println("OK");
                     }
                 } catch (IOException error) {

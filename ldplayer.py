@@ -30,6 +30,10 @@ class DeviceError(RuntimeError):
     pass
 
 
+class EmptyKeepWindow(DeviceError):
+    """The viewer is open and its virtual display has no activity."""
+
+
 def wait_for_android(adb, cancel: Event, *, shared_storage=False) -> int:
     deadline = time.monotonic() + 45
     while not cancel.is_set():
@@ -166,6 +170,7 @@ class KeepWindows:
     outdoor_on_primary: bool
     viewer_visible: bool = True
     outdoor_displays: frozenset[int] = frozenset()
+    empty_displays: frozenset[int] = frozenset()
 
     @classmethod
     def from_activities(cls, dump: str) -> "KeepWindows":
@@ -176,6 +181,7 @@ class KeepWindows:
             dump)
         has_keep = {}
         outdoor = set()
+        empty = set()
         viewer_visible = False
         record = r"ActivityRecord\{[^\n}]*?\bu\d+\s+([\w.]+)/([\w.$]+)"
         for number, block in blocks:
@@ -193,13 +199,15 @@ class KeepWindows:
                     foreground.append(top.groups())
             display_id = int(number)
             has_keep[display_id] = any(package == KEEP_PACKAGE for package, _ in foreground)
+            if not foreground and not re.search(r"\bvisible=true\b|topResumedActivity=ActivityRecord", block):
+                empty.add(display_id)
             if any(pkg == KEEP_PACKAGE and name.endswith(".VpOutdoorTrainingActivity") for pkg, name in foreground):
                 outdoor.add(display_id)
             if display_id == 0:
                 viewer_visible = any(pkg == VIEWER_PACKAGE and name.endswith(".Viewer") for pkg, name in foreground)
         if 0 not in has_keep:
             raise DeviceError("无法确认 Keep 所在的窗口。请确认雷电已解锁，再重试。")
-        return cls(has_keep, 0 in outdoor, viewer_visible, frozenset(outdoor))
+        return cls(has_keep, 0 in outdoor, viewer_visible, frozenset(outdoor), frozenset(empty))
 
     def check_primary(self) -> None:
         if self.outdoor_on_primary:
@@ -213,6 +221,8 @@ class KeepWindows:
 
     def require_viewer(self, display_id: int) -> None:
         if not self.viewer_has_keep(display_id):
+            if self.viewer_visible and display_id in self.empty_displays:
+                raise EmptyKeepWindow("Keep 未进入计步窗口，虚拟屏幕当前为空。")
             raise DeviceError("Keep 未进入计步窗口。请点「打开 Keep 计步窗口」，在底部有「关闭计步窗口」的页面继续。")
         if not self.viewer_visible:
             raise DeviceError("计步窗口已被遮住。请在雷电中回到底部有「关闭计步窗口」的页面。")
@@ -387,6 +397,15 @@ class LDPlayer:
     def locate(self, index: int, point: Point) -> None:
         longitude, latitude = point
         self.command("locate", "--index", str(index), "--LLI", f"{longitude:.7f},{latitude:.7f}")
+
+    def last_gps_fix(self, index: int) -> Point | None:
+        info = self.command("adb", "--index", str(index), "--command", "shell dumpsys location", timeout=5)
+        fix = re.search(r"(?mi)^\s*last location=Location\[gps\s+(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\s", info)
+        if fix:
+            latitude, longitude = map(float, fix.groups())
+            if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+                return longitude, latitude
+        return None
 
     def gravity(self, index: int, vector: tuple[float, ...]) -> None:
         self.command("action", "--index", str(index), "--key", "call.gravity", "--value",

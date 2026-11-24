@@ -25,6 +25,7 @@ class VirtualPedometer:
         self.sock, self.reader = sock, reader
         self.display_id = display_id
         self.active = False
+        self.prior_steps = 0
         self.version = version
         self.lock = RLock()
 
@@ -41,7 +42,7 @@ class VirtualPedometer:
             sock = socket.create_connection(("127.0.0.1", port), timeout=1.5)
             reader = sock.makefile("rb")
             banner = reader.readline(64).strip()
-            match = re.fullmatch(rb"EDA([123]) ([1-9]\d*)", banner)
+            match = re.fullmatch(rb"EDA([1-4]) ([1-9]\d*)", banner)
             if match:
                 return cls(device, index, port, sock, reader, int(match[2]), int(match[1]))
         except (OSError, ValueError, DeviceError):
@@ -85,21 +86,46 @@ class VirtualPedometer:
 
     def keep_state(self) -> str:
         state = self.query("STATE")
-        if state not in {"READY", "RUNNING", "PAUSED", "UNKNOWN"}:
+        if state not in {"READY", "RUNNING", "PAUSED", "UNKNOWN", "LOCATION_PROMPT"}:
             raise DeviceError("计步窗口返回了无法识别的 Keep 状态。")
         return state
 
     def check_keep_window(self) -> None:
         self.device.keep_windows(self.index).require_viewer(self.display_id)
 
-    def keep_action(self, action: str):
-        if action not in {"PAUSE", "RESUME"}:
-            raise ValueError("未知的 Keep 操作。")
-        if self.query("ACTION " + action) != "OK":
-            raise DeviceError("Keep 计步窗口未确认起停请求。")
+    def restore_empty_window(self, cancel):
+        def adb(command, timeout=10):
+            return self.device.command("adb", "--index", str(self.index), "--command", command, timeout=timeout)
+        windows = self.device.keep_windows(self.index)
+        if self.display_id not in windows.empty_displays:
+            windows.require_viewer(self.display_id)
+            return
+        _ensure_keep_on_display(self.device, self.index, self.display_id, adb, cancel)
 
-    def begin(self, steps: int):
-        self._send(f"BEGIN {steps}", ack=True)
+    def keep_action(self, action: str):
+        if action not in {"SELECT_RUN", "GO", "PAUSE", "RESUME"}:
+            raise ValueError("未知的 Keep 操作。")
+        if action in {"SELECT_RUN", "GO"} and self.version < 4:
+            raise DeviceError("当前计步窗口需要在 Keep 手动点 GO。关闭旧计步窗口再重新打开即可升级。")
+        # A v4 action waits for a fresh accessibility scan and Android's click result.
+        with self.lock:
+            timeout = self.sock.gettimeout()
+            self.sock.settimeout(4)
+            try:
+                reply = self.query("ACTION " + action)
+            finally:
+                self.sock.settimeout(timeout)
+        if self.version < 4 and reply == "OK":
+            return True
+        if self.version >= 4 and reply in {"CLICKED", "ALREADY"}:
+            return True
+        if self.version >= 4 and reply in {"MISSING", "REJECTED"}:
+            return False
+        raise DeviceError("计步窗口返回了无法识别的起停操作结果。")
+
+    def begin(self, steps: int, *, prior_steps=0):
+        self._send(f"BEGIN {steps-prior_steps}", ack=True)
+        self.prior_steps = prior_steps
 
     def orient(self, heading: float, *, immediate=False):
         if self.version < 3:
@@ -110,7 +136,8 @@ class VirtualPedometer:
 
     def sample(self, motion: Motion, *, essential=True):
         self.active = True
-        self._send(f"S {motion.footfalls:.8f} {motion.cadence:.6f} {motion.step_length:.6f}")
+        remaining_phase = max(0.0, motion.footfalls - self.prior_steps)
+        self._send(f"S {remaining_phase:.8f} {motion.cadence:.6f} {motion.step_length:.6f}")
 
     def rest(self):
         if self.active:
@@ -118,7 +145,7 @@ class VirtualPedometer:
             self.active = False
 
     def finish(self, steps: int):
-        self._send(f"END {steps}", ack=True)
+        self._send(f"END {steps-self.prior_steps}", ack=True)
         self.active = False
 
     def close(self):

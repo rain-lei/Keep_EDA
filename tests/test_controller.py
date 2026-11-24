@@ -350,6 +350,31 @@ class DeviceTests(unittest.TestCase):
         sensor.finish.assert_not_called()
         sensor.close.assert_called_once()
 
+    def test_checkpoint_starts_at_saved_fix_and_sends_remaining_steps(self):
+        device, bridge = Mock(spec=LDPlayer), Mock(spec=VirtualPedometer)
+        device.reserve_location.return_value = nullcontext()
+        device.watch_instance.return_value = nullcontext(lambda: None)
+        bridge.version = 4
+        plan, track = RunPlan(20, 360, False, 9), CampusTrack("track")
+        seconds = plan.duration / 2
+        first, last = plan.pacing.at(seconds), plan.pacing.at(plan.duration)
+        device.last_gps_fix.return_value = track.travel_path(plan).at(first.meters)
+        bridge.keep_state.side_effect = ["PAUSED", "PAUSED", "PAUSED", "RUNNING", "PAUSED"]
+        control = VirtualClock()
+        def status(state, _):
+            if state == "attach_paused":
+                control.attach_paused.set()
+        points = []
+        with patch("playback.VirtualPedometer.connect", return_value=bridge):
+            self.assertTrue(replay_on_device(track, plan, control, device, 0, points.append, link_keep=True,
+                                             checkpoint=(seconds, first.steps), paused_only=True, status=status))
+        self.assertEqual((points[0].seconds, points[0].meters), (seconds, first.meters))
+        self.assertEqual(points[-1].meters, plan.meters)
+        self.assertEqual(device.locate.call_args_list[0].args[1], device.last_gps_fix.return_value)
+        self.assertEqual(control.last_sent()[1], last.steps)
+        bridge.begin.assert_called_once_with(last.steps, prior_steps=first.steps)
+        bridge.keep_action.assert_called_once_with("RESUME")
+
     def test_gait_alternates_side_and_restores_after_the_last_write(self):
         device = Mock(spec=LDPlayer)
         neutral = (0.05, 9.7, 1.5)
@@ -418,6 +443,49 @@ class DeviceTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_reconnected_pedometer_counts_only_new_steps(self):
+        bridge = VirtualPedometer(Mock(), 0, 1234, Mock(), Mock(), 3, version=4)
+        bridge._send = Mock()
+        bridge.begin(3000, prior_steps=805)
+        bridge.sample(Motion(784.85, 2.78, 168, 803.5))
+        bridge.sample(Motion(787.00, 2.78, 168, 806.5))
+        bridge.finish(3000)
+        self.assertEqual([c.args[0].split()[:2] for c in bridge._send.call_args_list],
+                         [["BEGIN", "2195"], ["S", "0.00000000"], ["S", "1.50000000"], ["END", "2195"]])
+
+    def test_v4_actions_distinguish_click_result_from_workout_state(self):
+        device = Mock(spec=LDPlayer)
+        device.command.return_value = "31045"
+        outbound, inbound = socket.socketpair()
+        received = []
+        answers = (b"READY", b"CLICKED", b"MISSING", b"CLICKED", b"RUNNING", b"REJECTED",
+                   b"ALREADY", b"PAUSED", b"LOCATION_PROMPT")
+        def serve():
+            with inbound, inbound.makefile("rb") as reader:
+                inbound.sendall(b"EDA4 3\n")
+                for answer in answers:
+                    received.append(reader.readline().strip())
+                    inbound.sendall(answer+b"\n")
+        listener = threading.Thread(target=serve, daemon=True)
+        listener.start()
+        with patch("sensor_bridge.socket.create_connection", return_value=outbound):
+            bridge = VirtualPedometer.connect(device, 0)
+        try:
+            self.assertEqual(bridge.keep_state(), "READY")
+            self.assertTrue(bridge.keep_action("SELECT_RUN"))
+            self.assertFalse(bridge.keep_action("GO"))
+            self.assertTrue(bridge.keep_action("GO"))
+            self.assertEqual(bridge.keep_state(), "RUNNING")
+            self.assertFalse(bridge.keep_action("PAUSE"))
+            self.assertTrue(bridge.keep_action("PAUSE"))
+            self.assertEqual(bridge.keep_state(), "PAUSED")
+            self.assertEqual(bridge.keep_state(), "LOCATION_PROMPT")
+        finally:
+            bridge.close()
+            listener.join(1)
+        self.assertEqual(received, [b"STATE", b"ACTION SELECT_RUN", b"ACTION GO", b"ACTION GO", b"STATE",
+                                    b"ACTION PAUSE", b"ACTION PAUSE", b"STATE", b"STATE"])
+
     def test_android_protocol_counts_once_and_releases_the_selected_forward(self):
         device = Mock(spec=LDPlayer)
         device.command.return_value = "31041"
@@ -550,6 +618,7 @@ class BridgeTests(unittest.TestCase):
         device.reserve_location.return_value = nullcontext()
         device.watch_instance.return_value = nullcontext(lambda: None)
         bridge = Mock(spec=VirtualPedometer)
+        bridge.version = 4
         bridge.check_keep_window.side_effect = lambda: windows.require_viewer(2)
         with patch("playback.VirtualPedometer.connect", return_value=bridge):
             with self.assertRaisesRegex(DeviceError, "户外跑步页在雷电普通窗口"):
@@ -705,12 +774,15 @@ class DashboardTests(unittest.TestCase):
                 time.sleep(.01)
             return False
         device, bridge = Mock(spec=LDPlayer), Mock(spec=VirtualPedometer)
+        bridge.version = 4
         device.reserve_location.return_value = nullcontext()
         device.watch_instance.return_value = nullcontext(lambda: None)
         state = ["READY"]
         actions = []
         bridge.keep_state.side_effect = lambda: state[0]
         def act(action):
+            if action in {"SELECT_RUN", "GO"}:
+                return True
             actions.append(action)
             if actions == ["PAUSE", "RESUME", "PAUSE"]:
                 state[0] = "PAUSED"  # Acknowledge the automatic final pause.
@@ -723,7 +795,7 @@ class DashboardTests(unittest.TestCase):
                 dash.km.set("0.010")
                 dash.pace.set("3:00")
                 dash.start_run(False)
-                self.assertTrue(pump_until(lambda: "现在可以" in dash.status.get()))
+                self.assertTrue(pump_until(lambda: "已点击" in dash.status.get()))
                 self.assertEqual(dash.stop_button.cget("text"), "取消等待")
                 state[0] = "RUNNING"
                 self.assertTrue(pump_until(lambda: dash.has_sample))
@@ -767,6 +839,13 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(dash.modes.tab(dash.modes.select(), "text"), "Keep 实时记录")
                 self.assertTrue(dash.motion_enabled.get())
                 self.assertTrue(dash.random_start.get())
+                dash.link_check.invoke()
+                self.assertEqual(dash.play_button.cget("text"), "实时回放（手动起停）")
+                self.assertIn("手动起停", dash.status.get())
+                self.assertIs(json.loads(prefs.read_bytes())["link_keep"], False)
+                dash.link_check.invoke()
+                self.assertEqual(dash.play_button.cget("text"), "同步开跑")
+                self.assertIs(json.loads(prefs.read_bytes())["link_keep"], True)
                 self.assertEqual(dash.map.start, dash.track.start_point(dash.plan))
                 with patch("app.LDPlayer") as factory, patch("sensor_bridge.VirtualPedometer.connect", return_value=None), patch.object(
                     dash, "task", side_effect=lambda kind, msg, work: work(PlaybackControl())

@@ -9,7 +9,6 @@ import android.view.accessibility.AccessibilityWindowInfo;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
 
 /** Observe only Keep on our virtual display; never save or discard an activity. */
 final class KeepUi implements AutoCloseable {
@@ -18,7 +17,6 @@ final class KeepUi implements AutoCloseable {
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private volatile String state = "UNKNOWN";
     private volatile long observed, lastQuery;
-    private final AtomicReference<String> requested = new AtomicReference<>();
 
     KeepUi(Controller owner, UiAutomation automation) {
         this.owner = owner;
@@ -28,17 +26,20 @@ final class KeepUi implements AutoCloseable {
                     | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                     | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
         automation.setServiceInfo(info);
-        worker.scheduleWithFixedDelay(this::scan, 0, 250, TimeUnit.MILLISECONDS);
+        worker.scheduleWithFixedDelay(() -> {
+            if (SystemClock.elapsedRealtime() - lastQuery <= 2000) scan(null);
+        }, 0, 250, TimeUnit.MILLISECONDS);
     }
 
     String state() {
         lastQuery = SystemClock.elapsedRealtime();
         return lastQuery-observed < 1800 ? state : "UNKNOWN";
     }
-    void request(String action) {
-        if (!action.equals("PAUSE") && !action.equals("RESUME")) throw new IllegalArgumentException("action");
-        requested.set(action);
+    String request(String action) {
+        if (!action.equals("SELECT_RUN") && !action.equals("GO") && !action.equals("PAUSE") && !action.equals("RESUME"))
+            throw new IllegalArgumentException("action");
         lastQuery = SystemClock.elapsedRealtime();
+        return scan(action);
     }
 
     private String role(AccessibilityNodeInfo node) {
@@ -59,8 +60,7 @@ final class KeepUi implements AutoCloseable {
         }
     }
 
-    private void scan() {
-        if (SystemClock.elapsedRealtime()-lastQuery > 2000) return;
+    private synchronized String scan(String action) {
         List<AccessibilityNodeInfo> nodes = new ArrayList<>();
         try {
             SparseArray<List<AccessibilityWindowInfo>> displays = automation.getWindowsOnAllDisplays();
@@ -68,30 +68,53 @@ final class KeepUi implements AutoCloseable {
             if (windows != null) {
                 // Only the top visible Keep window: a dialog must not expose a covered run control.
                 for (AccessibilityWindowInfo window : windows) {
+                    if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
                     AccessibilityNodeInfo root = window.getRoot();
-                    if (root == null) continue;
+                    if (root == null) break;
                     if ("com.gotokeep.keep".contentEquals(String.valueOf(root.getPackageName()))) {
                         collect(root, nodes);
-                        break;
+                    } else {
+                        root.recycle();
                     }
-                    root.recycle();
+                    break;
                 }
             }
-            AccessibilityNodeInfo pause = null, resume = null;
-            boolean ready = false;
+            AccessibilityNodeInfo pause = null, resume = null, go = null, outdoorLabel = null;
+            boolean locationPrompt = false;
             for (AccessibilityNodeInfo node : nodes) {
                 String role = role(node);
                 if (role.equals("PAUSE")) pause = node;
                 if (role.equals("RESUME")) resume = node;
-                if (role.equals("GO")) ready = true;
+                if (role.equals("GO")) go = node;
+                if ("com.gotokeep.keep:id/textGameName".equals(node.getViewIdResourceName()) &&
+                    "户外跑步".contentEquals(String.valueOf(node.getText())) && node.isVisibleToUser()) outdoorLabel = node;
+                if (node.isVisibleToUser() && ("精准运动定位".contentEquals(String.valueOf(node.getText())) ||
+                        "精准运动定位".contentEquals(String.valueOf(node.getContentDescription())))) locationPrompt = true;
             }
-            state = resume != null ? "PAUSED" : pause != null ? "RUNNING" : ready ? "READY" : "UNKNOWN";
+            state = locationPrompt ? "LOCATION_PROMPT" :
+                    resume != null ? "PAUSED" : pause != null ? "RUNNING" : go != null ? "READY" : "UNKNOWN";
             observed = SystemClock.elapsedRealtime();
-            String action = requested.getAndSet(null);
-            AccessibilityNodeInfo target = "PAUSE".equals(action) ? pause : "RESUME".equals(action) ? resume : null;
-            if (target != null) target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            if (action == null) return state;
+            if ("SELECT_RUN".equals(action)) {
+                if (go == null || outdoorLabel == null || !"READY".equals(state)) return "MISSING";
+                AccessibilityNodeInfo tile = outdoorLabel.getParent();
+                try {
+                    return tile != null && tile.isVisibleToUser() && tile.isEnabled() && tile.isClickable() &&
+                           tile.performAction(AccessibilityNodeInfo.ACTION_CLICK) ? "CLICKED" : "REJECTED";
+                } finally {
+                    if (tile != null) tile.recycle();
+                }
+            }
+            if (("PAUSE".equals(action) && "PAUSED".equals(state)) ||
+                ("RESUME".equals(action) && "RUNNING".equals(state))) return "ALREADY";
+            AccessibilityNodeInfo target = "PAUSE".equals(action) && "RUNNING".equals(state) ? pause :
+                "RESUME".equals(action) && "PAUSED".equals(state) ? resume :
+                "GO".equals(action) && "READY".equals(state) ? go : null;
+            if (target == null) return "MISSING";
+            return target.performAction(AccessibilityNodeInfo.ACTION_CLICK) ? "CLICKED" : "REJECTED";
         } catch (Exception ignored) {
             state = "UNKNOWN";
+            return "MISSING";
         } finally {
             for (AccessibilityNodeInfo node : nodes) node.recycle();
         }
