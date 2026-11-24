@@ -12,6 +12,7 @@ import shutil
 import socket
 from statistics import median
 import subprocess
+from tempfile import TemporaryFile
 import time
 from threading import Event
 from uuid import uuid4
@@ -203,23 +204,30 @@ class LDPlayer:
             raise DeviceError("无法为此实例预留定位接口。")
         try:
             if already_open:
-                raise DeviceError(f"另一窗口正在控制实例 {index} 的定位。请先结束该窗口的回放。")
+                raise DeviceError(f"实例 {index} 的定位正被其他控制台占用。请等原窗口完成定位或打开计步窗口，"
+                                  "如在等待 GO 或回放中，请在原窗口点「结束」。")
             yield
         finally:
             kernel.CloseHandle(handle)
 
     def command(self, *arguments: str, timeout: float = 8) -> str:
         try:
-            result = subprocess.run(
-                [str(self.executable), *arguments], cwd=self.executable.parent,
-                capture_output=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            # The ADB server can inherit ldconsole's output handles. Pipes would
+            # wait for that server to exit even after the command itself timed out.
+            with TemporaryFile() as stdout, TemporaryFile() as stderr:
+                result = subprocess.run(
+                    [str(self.executable), *arguments], cwd=self.executable.parent,
+                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                    timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                stdout.seek(0)
+                stderr.seek(0)
+                output = decode_output(stdout.read())
+                errors = decode_output(stderr.read())
         except subprocess.TimeoutExpired as error:
             raise DeviceError(f"雷电命令 {arguments[0]} 超时。请检查模拟器是否响应。") from error
         except OSError as error:
             raise DeviceError(f"无法调用雷电控制台：{error}") from error
-        output = decode_output(result.stdout)
-        errors = decode_output(result.stderr)
         detail = "\n".join(part for part in (output, errors) if part)
         if result.returncode or re.search(
             r"(?im)^\s*(?:error(?:\s|:)|failed\b|failure\b|unknown command|invalid (?:parameter|command)|"

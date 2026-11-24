@@ -649,11 +649,15 @@ class Dashboard:
             self.root.after(60, self.poll)
 
     def close(self) -> None:
+        if self.closing:
+            return
         self.save_settings()
         self.closing = True
         self.control.stop()
         if self.job:
-            self.root.withdraw()
+            self.root.title("正在关闭 · 开发区校园跑")
+            self.tell("正在结束当前操作，完成后会自动关闭。")
+            self.update_controls()
         else:
             self.root.destroy()
 

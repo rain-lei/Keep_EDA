@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from itertools import pairwise
 import json
@@ -202,6 +203,43 @@ class RouteTests(unittest.TestCase):
 
 
 class DeviceTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows command output and location reservation")
+    def test_daemon_inheriting_output_does_not_hold_location(self):
+        # ADB may start a server that outlives ldconsole with both output handles open.
+        device = LDPlayer(Path(sys.executable))
+        index = 73
+        launcher = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
+            "stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)\n"
+            "print('34', flush=True)\n"
+            "print('starting server', file=sys.stderr, flush=True)\n"
+            "time.sleep(float(sys.argv[2]))"
+        )
+        with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as worker:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(6)
+            helper = (f"import socket; s=socket.create_connection({listener.getsockname()!r}, 10); "
+                      "s.recv(1)")
+
+            def query(delay):
+                with device.reserve_location(index):
+                    return device.command("-c", launcher, helper, str(delay), timeout=2)
+
+            for delay in (0, 15):
+                with self.subTest(command_times_out=bool(delay)):
+                    future = worker.submit(query, delay)
+                    connection, _ = listener.accept()
+                    with connection:  # Keep the descendant alive through the retry.
+                        if delay:
+                            with self.assertRaisesRegex(DeviceError, "超时"):
+                                future.result(timeout=5)
+                        else:
+                            self.assertEqual(future.result(timeout=5), "34")
+                        with device.reserve_location(index):
+                            pass
+
     @unittest.skipUnless(os.name == "nt", "Windows process lifetime monitor")
     def test_vm_exit_wakes_native_check_without_another_console_query(self):
         device = LDPlayer(Path("ldconsole.exe"))
