@@ -22,12 +22,12 @@ from ldplayer import LDPlayer, console_at, find_console
 from live_history import LastReplay
 from playback import PlaybackControl, Sample, replay, replay_on_device
 from route_view import FONT, GREEN, INK, RouteView
-from sensor_bridge import open_step_viewer, orient_step_viewer
+from sensor_bridge import locate_start, open_step_viewer
 
 
 BACKGROUND, PAPER, LIGHT, MUTED = "#f4f6f2", "#ffffff", "#eaf0e9", "#536a5e"
 SETTINGS = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "KeepEDA" / "settings.json"
-INITIAL_HINT = "打开 Keep 计步窗口，点「实时回放」待命，再在底部有「关闭计步窗口」的 Keep 页面点 GO。"
+INITIAL_HINT = "使用起停联动时，先在计步窗口进入户外跑步。电脑点「实时回放」，看到「起点已就绪」后再点 GO。"
 PERMISSION_HINT = "Keep 的「身体活动」权限已关闭。可在 Android 的「应用 → Keep → 权限」中允许身体活动。"
 
 
@@ -63,7 +63,7 @@ class Dashboard:
         self.events = Queue()
         self.job = ""
         self.control = PlaybackControl()
-        self.paused = False
+        self.checking_keep = False
         self.closing = False
         self.has_sample = False
         self.devices = []
@@ -322,8 +322,11 @@ class Dashboard:
             self.play_button.grid_remove()
             self.pause_button.grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=(0, 5))
             self.stop_button.grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=(0, 5))
-            self.pause_button.configure(text="继续" if self.paused else "暂停",
-                                       state="normal" if self.has_sample and not self.control.cancel.is_set() else "disabled")
+            pending = self.control.pending_action
+            caption = {"PAUSE": "正在暂停…", "RESUME": "正在继续…"}.get(pending)
+            can_toggle = self.has_sample and not pending and not self.checking_keep and not self.control.cancel.is_set()
+            self.pause_button.configure(text=caption or ("继续" if self.control.paused and self.has_sample else "暂停"),
+                                        state="normal" if can_toggle else "disabled")
             waiting = self.job == "live" and self.linking and not self.has_sample
             self.stop_button.configure(text="取消等待" if waiting else "结束",
                                        state="disabled" if self.control.cancel.is_set() else "normal")
@@ -383,7 +386,7 @@ class Dashboard:
             return
         self.job = kind
         self.control = PlaybackControl()
-        self.paused = self.has_sample = False
+        self.checking_keep = self.has_sample = False
         self.update_controls()
         self.tell(message)
         control = self.control
@@ -421,28 +424,26 @@ class Dashboard:
         linked = check_motion and self.link_enabled.get()
 
         def action(control):
-            if not device.prepare(index, control.cancel):
-                return "已取消。"
-            self.events.put(("devices", device.instances()))
-            if kind == "keep":
-                if check_motion:
-                    with device.reserve_location(index):
-                        return open_step_viewer(device, index, control.cancel, heading=heading)
-                return device.open_keep(index)
-            if kind == "permissions":
-                return device.open_keep_permissions(index)
-            if start is None:
-                raise ValueError("请先填写有效的跑步距离和配速。")
             with device.reserve_location(index):
-                if linked:
-                    device.keep_windows(index).check_primary()
-                device.check_location(index)
-                device.locate(index, start)
-                if check_motion:
-                    orient_step_viewer(device, index, heading)
+                if not device.prepare(index, control.cancel):
+                    return "已取消。"
+                self.events.put(("devices", device.instances()))
+                if control.cancel.is_set():
+                    return "已取消。"
+                if kind == "keep":
+                    if check_motion:
+                        return open_step_viewer(device, index, control.cancel, heading=heading)
+                    return device.open_keep(index)
+                if kind == "permissions":
+                    return device.open_keep_permissions(index)
+                if start is None:
+                    raise ValueError("请先填写有效的跑步距离和配速。")
+                locate_start(device, index, start, heading, control.cancel, motion=check_motion, linked=linked)
             self.events.put(("sample", Sample(0, 0, start, heading=heading)))
-            hint = (PERMISSION_HINT if check_motion and device.keep_activity_permission(index) is False
-                    else "点击「实时回放」待命，再在 Keep 中开始户外跑步。")
+            hint = ("进入计步窗口的户外跑步，点「实时回放」，看到「起点已就绪」后再点 GO。"
+                    if linked else "当前为手动起停。准备好 Keep 后点「实时回放」，电脑会立即开始。")
+            if check_motion and device.keep_activity_permission(index) is False:
+                hint += PERMISSION_HINT
             return f"已定位到{self.track.name}起点。{hint}"
         self.task(kind, f"正在连接实例 {index}，等待 Android 就绪…", action)
 
@@ -509,19 +510,22 @@ class Dashboard:
         messagebox.showinfo(f"上次回放 · 实例 {self.selected_index}", body, parent=self.root)
 
     def toggle_pause(self) -> None:
+        if (self.job not in ("live", "preview") or not self.has_sample or self.checking_keep
+                or self.control.cancel.is_set()):
+            return
         if self.job == "live" and self.linking:
-            self.control.request("RESUME" if self.paused else "PAUSE")
-            self.paused = not self.paused
-            self.tell("正在等待 Keep 确认继续…" if not self.paused else "回放已暂停，正在同步 Keep…")
+            action = "RESUME" if self.control.paused else "PAUSE"
+            if not self.control.request(action):
+                return
+            self.tell("正在等待 Keep 确认继续…" if action == "RESUME" else "回放已暂停，正在同步 Keep…")
             self.update_controls()
             return
-        if self.paused:
+        if self.control.paused:
             self.control.resume()
             self.tell("离线预演中（20 倍速）。" if self.job == "preview" else "正在向雷电发送实时定位。")
         else:
             self.control.pause()
             self.tell("预演已暂停。" if self.job == "preview" else "定位回放已暂停。Keep 的计时由应用内控制。")
-        self.paused = not self.paused
         self.update_controls()
 
     def stop(self) -> None:
@@ -556,7 +560,10 @@ class Dashboard:
                 export_fit(path, self.track, plan)
                 if control.cancel.is_set():
                     return "已取消传输。"
-                name = device.send_fit(index, path, plan.meters)
+                try:
+                    name = device.send_fit(index, path, plan.meters, control.cancel)
+                except InterruptedError:
+                    return "已取消传输。"
             return f"已传入实例 {index}。在 Keep 的运动数据文件导入中选择「下载」里的 {name}。"
         self.task("transfer", "正在生成并传输模拟 FIT…", transfer)
 
@@ -636,8 +643,10 @@ class Dashboard:
                         self.update_controls()
                 elif kind == "live_state":
                     state, message = value
-                    if state in {"paused", "running"}:
-                        self.paused = state == "paused"
+                    if self.control.cancel.is_set() and state not in {"ended", "notice"}:
+                        continue
+                    if state in {"checking", "syncing", "paused", "running"}:
+                        self.checking_keep = state == "checking"
                         self.update_controls()
                     self.tell(message, state == "notice")
                 else:

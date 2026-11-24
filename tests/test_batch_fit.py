@@ -97,6 +97,32 @@ class BatchTests(unittest.TestCase):
             self.assertTrue(export_batch(dest,track,self.plan,runs,Event(),lambda *_: None))
             self.assertEqual(dest.read_bytes(),initial)
 
+    def test_single_fit_cancellation_and_same_size_corruption_never_publish(self):
+        device = LDPlayer(Path("ldconsole.exe"))
+        with TemporaryDirectory() as folder:
+            source = Path(folder, "activity.fit")
+            source.write_bytes(b"fit data")
+            for mode in ("cancel", "damaged"):
+                with self.subTest(mode=mode):
+                    cancel = Event()
+                    def command(*args, **kwargs):
+                        cmd = args[-1]
+                        if cmd.startswith("push ") and mode == "cancel":
+                            cancel.set()
+                        if "getprop" in cmd:
+                            return "1" if "boot_completed" in cmd else "34"
+                        if "stat -c" in cmd:
+                            return str(source.stat().st_size)
+                        if "sha256sum" in cmd:
+                            return "0" * 64
+                        return ""
+                    with patch.object(device, "command", side_effect=command) as calls:
+                        with self.assertRaises(InterruptedError if mode == "cancel" else DeviceError):
+                            device.send_fit(0, source, 3000, cancel)
+                    commands = [call.args[-1] for call in calls.call_args_list]
+                    self.assertFalse(any(cmd.startswith("shell mv ") for cmd in commands))
+                    self.assertTrue(commands[-1].startswith("shell rm -f ") and commands[-1].endswith(".part"))
+
     def test_corrupt_or_cancelled_transfer_never_publishes_its_zip(self):
         from hashlib import sha256
         device = LDPlayer(Path("ldconsole.exe"))

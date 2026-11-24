@@ -1,5 +1,6 @@
 """Connect the selected LDPlayer instance to Android 14's virtual running sensors."""
 
+from contextlib import ExitStack
 from hashlib import sha256
 from math import isfinite
 from pathlib import Path
@@ -9,11 +10,11 @@ import subprocess
 from threading import RLock, Thread
 import time
 
-from ldplayer import DeviceError, KEEP_PACKAGE, LDPlayer, wait_for_android
+from ldplayer import DeviceError, KEEP_PACKAGE, LDPlayer, VIEWER_PACKAGE, wait_for_android
 from motion import Motion
 
 
-PACKAGE = "xyz.keepeda.sensors"
+PACKAGE = VIEWER_PACKAGE
 ADDRESS = "02:4B:45:44:41:14"
 APK = Path(__file__).resolve().parent / "data" / "keepeda-sensors.apk"
 
@@ -121,12 +122,11 @@ class VirtualPedometer:
         self.active = False
 
     def close(self):
-        try:
+        with ExitStack() as cleanup:
+            cleanup.callback(self._remove_forward, self.device, self.index, self.port)
+            cleanup.callback(self.sock.close)
+            cleanup.callback(self.reader.close)
             self.rest()
-        finally:
-            self.reader.close()
-            self.sock.close()
-            self._remove_forward(self.device, self.index, self.port)
 
 
 def open_step_viewer(device: LDPlayer, index: int, cancel, *, heading: float | None = None) -> str:
@@ -137,8 +137,17 @@ def open_step_viewer(device: LDPlayer, index: int, cancel, *, heading: float | N
         raise DeviceError("计步窗口需要 Android 14。取消勾选「同步跑步计步」可以打开普通 Keep。")
     if not adb(f"shell pm path {KEEP_PACKAGE}").startswith("package:"):
         raise DeviceError("所选雷电实例中未安装 Keep。")
-    device.keep_windows(index).check_primary()
+    if cancel.is_set():
+        raise InterruptedError("已取消打开计步窗口。")
+    windows = device.keep_windows(index)
+    windows.check_primary()
     bridge = VirtualPedometer.connect(device, index)
+    if bridge is None and (windows.viewer_visible or any(i > 0 and keep for i, keep in windows.has_keep.items())):
+        if cancel.wait(.25):
+            raise InterruptedError("已取消打开计步窗口。")
+        bridge = VirtualPedometer.connect(device, index)
+        if bridge is None:
+            raise DeviceError("已有计步窗口，但连接未响应。请检查原窗口，处理好当前运动后再重新打开。")
     reopen = bridge is not None
     if bridge is None:
         bridge = _start_step_bridge(device, index, cancel, adb)
@@ -147,35 +156,39 @@ def open_step_viewer(device: LDPlayer, index: int, cancel, *, heading: float | N
             raise DeviceError("已取消打开计步窗口。")
         if reopen:
             adb(f"shell am start --display 0 --activity-single-top -n {PACKAGE}/.Viewer")
-        _ensure_keep_on_display(device, index, bridge.display_id, adb, cancel)
+        windows = _ensure_keep_on_display(device, index, bridge.display_id, adb, cancel)
         if heading is not None:
+            if bridge.display_id in windows.outdoor_displays and not _at_start_screen(bridge, cancel):
+                return "已返回 Keep 计步窗口。请先在 Keep 中处理当前运动，再开始新的回放。"
             bridge.orient(heading, immediate=True)
     finally:
         bridge.close()
     return "Keep 已在计步窗口打开。请在底部有「关闭计步窗口」的页面进入户外跑步。"
 
 
-def _ensure_keep_on_display(device: LDPlayer, index: int, display_id: int, adb, cancel) -> None:
-    if device.keep_windows(index).viewer_has_keep(display_id):
-        return
+def _ensure_keep_on_display(device: LDPlayer, index: int, display_id: int, adb, cancel):
+    windows = device.keep_windows(index)
+    if windows.viewer_has_keep(display_id) and windows.viewer_visible:
+        return windows
     # Android can reuse a Keep task on another display even when am start succeeds.
-    resolved = adb(f"shell cmd package resolve-activity --brief -a android.intent.action.MAIN "
-                   f"-c android.intent.category.LAUNCHER {KEEP_PACKAGE}")
-    component = next((line.strip() for line in resolved.splitlines()
-                      if re.fullmatch(re.escape(KEEP_PACKAGE) + r"/[\w.$]+", line.strip())), None)
-    if not component:
-        raise DeviceError("找不到 Keep 的启动入口。")
-    if cancel.is_set():
-        raise DeviceError("已取消打开计步窗口。")
-    adb(f"shell am start --display {display_id} -n {component}")
+    if not windows.has_keep[display_id]:
+        resolved = adb(f"shell cmd package resolve-activity --brief -a android.intent.action.MAIN "
+                       f"-c android.intent.category.LAUNCHER {KEEP_PACKAGE}")
+        component = next((line.strip() for line in resolved.splitlines()
+                          if re.fullmatch(re.escape(KEEP_PACKAGE) + r"/[\w.$]+", line.strip())), None)
+        if not component:
+            raise DeviceError("找不到 Keep 的启动入口。")
+        if cancel.is_set():
+            raise DeviceError("已取消打开计步窗口。")
+        adb(f"shell am start --display {display_id} -n {component}")
     deadline = time.monotonic() + 4
     while not cancel.is_set():
         windows = device.keep_windows(index)
         if time.monotonic() >= deadline:
             windows.require_viewer(display_id)
-            return
-        if windows.viewer_has_keep(display_id):
-            return
+            return windows
+        if windows.viewer_has_keep(display_id) and windows.viewer_visible:
+            return windows
         cancel.wait(.3)
     raise DeviceError("已取消打开计步窗口。")
 
@@ -183,6 +196,8 @@ def _ensure_keep_on_display(device: LDPlayer, index: int, display_id: int, adb, 
 def _start_step_bridge(device: LDPlayer, index: int, cancel, adb) -> VirtualPedometer:
     installed = adb(f"shell pm path {PACKAGE}").removeprefix("package:").strip()
     digest = adb(f"shell sha256sum {installed}").split() if installed.startswith("/data/app/") else []
+    if cancel.is_set():
+        raise InterruptedError("已取消打开计步窗口。")
     if not digest or digest[0].lower() != sha256(APK.read_bytes()).hexdigest():
         output = adb(f'install -r --no-incremental "{APK}"', timeout=40)
         if "Success" not in output:
@@ -196,12 +211,18 @@ def _start_step_bridge(device: LDPlayer, index: int, cancel, adb) -> VirtualPedo
         return None
 
     association = find_association()
-    if association is None:
+    new_association = association is None
+    if cancel.is_set():
+        raise InterruptedError("已取消打开计步窗口。")
+    if new_association:
         adb(f"shell cmd companiondevice associate 0 {PACKAGE} {ADDRESS}")
         association = find_association()
     if association is None:
         raise DeviceError("Android 未能建立计步窗口的本地测试设备关联。")
+    runner = None
     try:
+        if cancel.is_set():
+            raise DeviceError("已取消打开计步窗口。")
         # Android creates an UiAutomation connection only for a waiting runner.
         # Keep that command alive while the emulator window remains open.
         try:
@@ -225,21 +246,52 @@ def _start_step_bridge(device: LDPlayer, index: int, cancel, adb) -> VirtualPedo
             raise DeviceError("已取消打开计步窗口。")
         raise DeviceError("Android 计步窗口未就绪。请确认雷电窗口已解锁，再点击「打开 Keep 计步窗口」。")
     except DeviceError:
-        try:
-            adb(f"shell am force-stop {PACKAGE}")
-            adb(f"shell cmd companiondevice disassociate 0 {PACKAGE} {ADDRESS}")
-        except DeviceError:
-            pass
+        if runner is not None and runner.poll() is None:
+            try:
+                adb(f"shell am force-stop {PACKAGE}")
+            except DeviceError:
+                pass
+        if new_association:
+            try:
+                adb(f"shell cmd companiondevice disassociate 0 {PACKAGE} {ADDRESS}")
+            except DeviceError:
+                pass
         raise
 
 
-def orient_step_viewer(device: LDPlayer, index: int, heading: float) -> bool:
-    """Align an already open viewer when the user repositions a random start."""
-    bridge = VirtualPedometer.connect(device, index)
-    if bridge is None:
-        return False
+def _at_start_screen(bridge, cancel) -> bool:
+    # The Android UI sampler wakes on the first query after an idle period.
+    deadline = time.monotonic() + 2
+    while not cancel.is_set():
+        state = bridge.keep_state()
+        if state != "UNKNOWN":
+            return state == "READY"
+        if time.monotonic() >= deadline:
+            return False
+        cancel.wait(.2)
+    raise InterruptedError("已取消定位。")
+
+
+def locate_start(device, index, point, heading, cancel, *, motion, linked):
+    windows = device.keep_windows(index) if linked else None
+    if windows:
+        windows.check_primary()
+    device.check_location(index)
+    bridge = VirtualPedometer.connect(device, index) if motion else None
     try:
-        bridge.orient(heading, immediate=True)
+        if windows and windows.outdoor_displays:
+            if bridge is None or bridge.display_id not in windows.outdoor_displays:
+                raise DeviceError("已有户外跑步页面，请先在 Keep 中检查当前运动。")
+            windows.require_viewer(bridge.display_id)
+            if not _at_start_screen(bridge, cancel):
+                raise DeviceError("当前户外跑步页尚未回到 GO。请先处理当前运动，再重新定位起点。")
+        if cancel.is_set():
+            raise InterruptedError("已取消定位。")
+        if bridge:
+            bridge.orient(heading, immediate=True)
+        if cancel.is_set():
+            raise InterruptedError("已取消定位。")
+        device.locate(index, point)
     finally:
-        bridge.close()
-    return True
+        if bridge:
+            bridge.close()

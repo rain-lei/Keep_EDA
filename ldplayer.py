@@ -14,7 +14,7 @@ from statistics import median
 import subprocess
 from tempfile import TemporaryFile
 import time
-from threading import Event
+from threading import Event, Lock
 from uuid import uuid4
 
 from campus import Point
@@ -22,6 +22,7 @@ from motion import Motion
 
 
 KEEP_PACKAGE = "com.gotokeep.keep"
+VIEWER_PACKAGE = "xyz.keepeda.sensors"
 CONSOLE_NAMES = ("ldconsole.exe", "dnconsole.exe")
 
 
@@ -59,8 +60,9 @@ def wait_for_android(adb, cancel: Event, *, shared_storage=False) -> int:
 class GravityPulse:
     """Stream the landing, unloading and alternating sway of each footfall."""
 
-    def __init__(self, device: "LDPlayer", index: int, neutral: tuple[float, ...]):
+    def __init__(self, device: "LDPlayer", index: int, neutral: tuple[float, ...], check_running=lambda: None):
         self.device, self.index, self.neutral = device, index, neutral
+        self.check_running = check_running
         magnitude = hypot(*neutral)
         self.up = tuple(v / magnitude for v in neutral)
         x, y, z = self.up
@@ -92,7 +94,11 @@ class GravityPulse:
         vector = tuple(n + gain*(vertical*u + sideways*s + forward*f)
                        for n, u, s, f in zip(self.neutral, self.up, self.side, self.forward))
         self.active = True
-        self.pending.append(self.writer.submit(self.device.gravity, self.index, vector))
+        self.pending.append(self.writer.submit(self._write, vector))
+
+    def _write(self, vector):
+        self.check_running()
+        self.device.gravity(self.index, vector)
 
     def rest(self) -> None:
         pending, self.pending = self.pending, []
@@ -103,7 +109,7 @@ class GravityPulse:
                 future.result()
         finally:
             if self.active:
-                self.device.gravity(self.index, self.neutral)
+                self._write(self.neutral)
                 self.active = False
 
     def close(self) -> None:
@@ -158,25 +164,42 @@ class Instance:
 class KeepWindows:
     has_keep: dict[int, bool]
     outdoor_on_primary: bool
+    viewer_visible: bool = True
+    outdoor_displays: frozenset[int] = frozenset()
 
     @classmethod
     def from_activities(cls, dump: str) -> "KeepWindows":
         # The global ResumedActivity and supervisor summary repeat other displays' tasks.
-        blocks = re.findall(r"(?ms)^Display #(\d+) \(activities[^\n]*\n(.*?)(?=^\S|^  ResumedActivity:|\Z)", dump)
+        blocks = re.findall(
+            r"(?ms)^Display #(\d+) \(activities[^\n]*\n(.*?)"
+            r"(?=^[ \t]*ResumedActivity:|^(?!\* (?:Task\{|Hist\s+#)|topResumedActivity=|mLastPausedActivity:)\S|\Z)",
+            dump)
         has_keep = {}
-        outdoor = False
+        outdoor = set()
+        viewer_visible = False
+        record = r"ActivityRecord\{[^\n}]*?\bu\d+\s+([\w.]+)/([\w.$]+)"
         for number, block in blocks:
-            records = re.findall(
-                rf"(?m)^[ \t]*(topResumedActivity=|\*[ \t]+Hist[ \t]+#\d+:[ \t]*)ActivityRecord\{{"
-                rf"[^\n}}]*?\bu\d+\s+{re.escape(KEEP_PACKAGE)}/([\w.$]+)", block)
+            # A task history includes stopped activities. Use the resumed component,
+            # or the top history entry of a task Android explicitly marks visible.
+            foreground = []
+            for task in re.split(r"(?m)^(?=[ \t]*\* Task\{)", block):
+                header = task.partition("\n")[0]
+                if re.search(r"\bvisible=false\b", header):
+                    continue
+                top = re.search(r"(?m)^[ \t]*topResumedActivity=" + record, task)
+                if top is None and re.search(r"\bvisible=true\b", header):
+                    top = re.search(r"(?m)^[ \t]*\*[ \t]+Hist[ \t]+#\d+:[ \t]*" + record, task)
+                if top:
+                    foreground.append(top.groups())
             display_id = int(number)
-            has_keep[display_id] = bool(records)
+            has_keep[display_id] = any(package == KEEP_PACKAGE for package, _ in foreground)
+            if any(pkg == KEEP_PACKAGE and name.endswith(".VpOutdoorTrainingActivity") for pkg, name in foreground):
+                outdoor.add(display_id)
             if display_id == 0:
-                outdoor = any(kind == "topResumedActivity=" and name.endswith(".VpOutdoorTrainingActivity")
-                              for kind, name in records)
+                viewer_visible = any(pkg == VIEWER_PACKAGE and name.endswith(".Viewer") for pkg, name in foreground)
         if 0 not in has_keep:
             raise DeviceError("无法确认 Keep 所在的窗口。请确认雷电已解锁，再重试。")
-        return cls(has_keep, outdoor)
+        return cls(has_keep, 0 in outdoor, viewer_visible, frozenset(outdoor))
 
     def check_primary(self) -> None:
         if self.outdoor_on_primary:
@@ -191,6 +214,8 @@ class KeepWindows:
     def require_viewer(self, display_id: int) -> None:
         if not self.viewer_has_keep(display_id):
             raise DeviceError("Keep 未进入计步窗口。请点「打开 Keep 计步窗口」，在底部有「关闭计步窗口」的页面继续。")
+        if not self.viewer_visible:
+            raise DeviceError("计步窗口已被遮住。请在雷电中回到底部有「关闭计步窗口」的页面。")
 
 
 def parse_list(output: str) -> list[Instance]:
@@ -298,8 +323,25 @@ class LDPlayer:
         instance = self.instance(index)
         if not instance.booted:
             raise DeviceError(f"雷电实例 {index} 已离线，轨迹发送已停止。")
+        # Some installations do not grant process handles. Compare the original
+        # PIDs as well as the boot flag so a replacement at the same index is detected.
+        lock = Lock()
+        last_check = time.monotonic()
+        offline = False
+
+        def check_list():
+            nonlocal last_check, offline
+            with lock:
+                if not offline and time.monotonic() - last_check >= 1:
+                    current = self.instance(index)
+                    offline = (not current.booted or any(old > 0 and old != new for old, new in
+                               ((instance.pid, current.pid), (instance.vm_pid, current.vm_pid))))
+                    last_check = time.monotonic()
+                if offline:
+                    raise DeviceError(f"雷电实例 {index} 已离线或已重启，轨迹发送已停止。")
+
         if os.name != "nt":
-            yield lambda: self.require_running(index)
+            yield check_list
             return
         import ctypes
         from ctypes import wintypes
@@ -312,18 +354,20 @@ class LDPlayer:
         kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
         with ExitStack() as cleanup:
             handles = []
-            for pid in {instance.pid, instance.vm_pid}:
-                if pid > 0:
-                    handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
-                    if handle:
-                        cleanup.callback(kernel.CloseHandle, handle)
-                        handles.append(handle)
+            pids = {pid for pid in (instance.pid, instance.vm_pid) if pid > 0}
+            for pid in pids:
+                handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+                if handle:
+                    cleanup.callback(kernel.CloseHandle, handle)
+                    handles.append(handle)
 
             def check():
                 if any(kernel.WaitForSingleObject(handle, 0) != 258 for handle in handles):  # WAIT_TIMEOUT means alive
                     raise DeviceError(f"雷电实例 {index} 已离线，轨迹发送已停止。")
+                if not handles or len(handles) != len(pids) or instance.vm_pid <= 0:
+                    check_list()
 
-            yield check if handles else lambda: self.require_running(index)
+            yield check
 
     def prepare(self, index: int, cancel: Event) -> bool:
         if cancel.is_set():
@@ -363,7 +407,7 @@ class LDPlayer:
             readings.append(tuple(map(float, event.groups())))
         return readings
 
-    def motion_sensor(self, index: int, cancel: Event) -> GravityPulse | None:
+    def motion_sensor(self, index: int, cancel: Event, check_running=lambda: None) -> GravityPulse | None:
         try:
             readings = self.accelerations(index)
         except DeviceError:
@@ -374,11 +418,13 @@ class LDPlayer:
         if not 25 < sum(v*v for v in base) < 200:
             return None
         # Measure the HAL offset at rest so that repeated runs do not accumulate bias.
+        check_running()
         try:
             self.gravity(index, base)
         except DeviceError:
             return None
-        cancel.wait(.45)
+        if cancel.wait(.45):
+            return None
         try:
             fresh = [r for r in self.accelerations(index) if r[0] > readings[-1][0]]
         except DeviceError:
@@ -387,8 +433,9 @@ class LDPlayer:
             observed = tuple(median(row[i] for row in fresh[-3:]) for i in range(1, 4))
             if all(abs(a-b) < 1 for a, b in zip(base, observed)):
                 base = tuple(2*a-b for a, b in zip(base, observed))
+                check_running()
                 self.gravity(index, base)
-        return GravityPulse(self, index, base)
+        return GravityPulse(self, index, base, check_running)
 
     def check_location(self, index: int) -> None:
         try:
@@ -430,26 +477,32 @@ class LDPlayer:
             return "已请求雷电打开 Keep。请在模拟器中确认应用已打开。"
         return "已打开 Keep。进入户外跑步，在地图上确认起点。"
 
-    def send_fit(self, index: int, source: Path, meters: int) -> str:
+    def send_fit(self, index: int, source: Path, meters: int, cancel: Event | None = None) -> str:
         name = f"DUT-EDA-sim-{meters}m-{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}.fit"
-        return self._send_download(index, source, name)
+        return self._send_download(index, source, name, cancel=cancel)
 
-    def send_batch_zip(self, index: int, source: Path, cancel: Event | None = None) -> str:
+    @staticmethod
+    def _download_hash(source: Path, cancel: Event | None) -> str:
         digest = sha256()
         with source.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024*1024), b""):
                 if cancel and cancel.is_set():
                     raise InterruptedError("已取消发送。")
                 digest.update(chunk)
+        return digest.hexdigest()
+
+    def send_batch_zip(self, index: int, source: Path, cancel: Event | None = None) -> str:
+        digest = self._download_hash(source, cancel)
         short_name = re.sub(r"[^A-Za-z0-9_-]", "_", source.stem)[:100]
-        name = f"{short_name}-{digest.hexdigest()[:10]}.zip"
-        return self._send_download(index, source, name, digest.hexdigest(), cancel)
+        name = f"{short_name}-{digest[:10]}.zip"
+        return self._send_download(index, source, name, digest, cancel)
 
     def _send_download(self, index: int, source: Path, name: str, digest: str | None = None,
                        cancel: Event | None = None) -> str:
         target = f"/sdcard/Download/{name}"
         partial = f"{target}.{uuid4().hex[:12]}.part"
         size = str(source.stat().st_size)
+        expected_hash = digest or self._download_hash(source, cancel)
 
         def adb(command: str, timeout=20) -> str:
             return self.command("adb", "--index", str(index), "--command", command, timeout=timeout)
@@ -459,10 +512,12 @@ class LDPlayer:
             if cancel and cancel.is_set():
                 raise InterruptedError("已取消发送。")
             adb(f'push "{source}" {partial}', timeout=180 if digest else 20)
+            if cancel and cancel.is_set():
+                raise InterruptedError("已取消发送。")
             if adb(f"shell stat -c %s {partial}").strip() != size:
                 raise DeviceError("传输校验失败。请检查该实例的本地 ADB 调试和下载目录。")
-            if digest and adb(f"shell sha256sum {partial}", timeout=120).split()[:1] != [digest]:
-                raise DeviceError("ZIP 内容校验失败，请重新发送。")
+            if adb(f"shell sha256sum {partial}", timeout=120).split()[:1] != [expected_hash]:
+                raise DeviceError("运动文件内容校验失败，请重新发送。")
             if cancel and cancel.is_set():
                 raise InterruptedError("已取消发送。")
             adb(f"shell mv {partial} {target}")

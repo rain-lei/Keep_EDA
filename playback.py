@@ -22,6 +22,8 @@ class PlaybackControl:
         self._elapsed = 0.0
         self._since: float | None = None
         self.suspensions = 0
+        self._pause_on_sleep = False
+        self._linked = False
         self._action = None
         self._last_location = None
         self._last_steps = None
@@ -38,17 +40,44 @@ class PlaybackControl:
         with self._changed:
             return self._last_location, self._last_steps
 
-    def request(self, action: str):
+    def request(self, action: str) -> bool:
         with self._changed:
+            if action not in ("PAUSE", "RESUME"):
+                raise ValueError("未知的起停操作。")
+            if self.cancel.is_set() or self._action is not None:
+                return False
             if action == "PAUSE":
                 self.pause()
             self._action = action
             self._changed.notify_all()
+            return True
 
-    def pop_action(self):
+    @property
+    def pending_action(self):
         with self._changed:
-            action, self._action = self._action, None
-            return action
+            return self._action
+
+    def sync_keep(self, paused: bool) -> bool:
+        """Apply an observed state without undoing a newer desktop request."""
+        with self._changed:
+            wanted = "PAUSE" if paused else "RESUME"
+            if self.cancel.is_set() or self._action not in (None, wanted):
+                return False
+            was_paused = self.paused
+            changed = self._action is not None or was_paused != paused
+            self._action = None
+            if was_paused != paused:
+                if paused:
+                    self.pause()
+                else:
+                    self.resume()
+            return changed
+
+    def start_live_clock(self, *, linked=False):
+        with self._changed:
+            self._pause_on_sleep = True
+            self._linked = linked
+            self.resume()
 
     def _advance(self) -> float:
         """One authoritative timeline, even when GPS and sensors wake at different times."""
@@ -56,8 +85,14 @@ class PlaybackControl:
             now = self._now()
             delta = max(0.0, now-self._since)
             if delta > 5:
-                delta = .5
                 self.suspensions += 1
+                if self._pause_on_sleep:
+                    self._since = None
+                    if self._linked:
+                        self._action = "PAUSE"
+                    self._changed.notify_all()
+                    return self._elapsed
+                delta = .5
             self._elapsed += delta
             self._since = now
         return self._elapsed
@@ -98,6 +133,8 @@ class PlaybackControl:
                 if self._since is not None:
                     rested = False
                     elapsed = self._advance()
+                    if self._since is None:
+                        continue
                     if elapsed >= deadline:
                         return elapsed
                     self._changed.wait(deadline - elapsed)
@@ -135,6 +172,8 @@ def replay(track: CampusTrack, plan: RunPlan, control: PlaybackControl, send: Ca
     pacing = plan.pacing
     if start_clock:
         control.resume()
+    if control.cancel.is_set():
+        return False
     first = pacing.at(0)
     send(Sample(0.0, 0.0, path.points[0], first.speed, first.cadence, 0, sensor is not None,
                 heading=path.heading_at(0)))
@@ -177,18 +216,15 @@ def replay(track: CampusTrack, plan: RunPlan, control: PlaybackControl, send: Ca
 def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl,
                      device: LDPlayer, index: int, report: Callable[[Sample], None], *, use_motion: bool = True,
                      link_keep: bool = False, status: Callable[[str, str], None] = lambda *_: None) -> bool:
-    next_check = 0.0
-
     def send(sample: Sample) -> None:
-        nonlocal next_check
-        if sample.seconds >= next_check or sample.meters == plan.meters:
-            check_running()
-            next_check = sample.seconds + 5
+        check_running()
+        if control.cancel.is_set():
+            return
         device.locate(index, sample.point)
-        if bridge:
-            bridge.orient(sample.heading, immediate=sample.seconds == 0)
         control.note_location(sample)
         monitor.positioned()
+        if bridge:
+            bridge.orient(sample.heading, immediate=sample.seconds == 0)
         report(replace(sample, motion_sent=sensor is not None, activity_allowed=allowed, virtual_steps=bridge is not None))
 
     with device.reserve_location(index), ExitStack() as resources:
@@ -198,32 +234,34 @@ def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl
         device.check_location(index)
         allowed = device.keep_activity_permission(index) if use_motion else None
         bridge = VirtualPedometer.connect(device, index) if use_motion else None
-        sensor = bridge or (device.motion_sensor(index, control.cancel) if use_motion and not link_keep else None)
-        monitor = RunMonitor(control, bridge if link_keep else None, status, with_steps=sensor is not None)
+        sensor = bridge or (device.motion_sensor(index, control.cancel, check_running) if use_motion and not link_keep else None)
+        monitor = RunMonitor(control, bridge if link_keep else None, status, with_steps=sensor is not None,
+                             check_running=check_running)
 
         def pulse_sent(steps):
             if bridge:
                 control.note_virtual_steps(steps)
             monitor.stepped()
+
+        def position_start():
+            check_running()
+            if not control.cancel.is_set():
+                bridge.orient(track.travel_path(plan).heading_at(0), immediate=True)
+            if not control.cancel.is_set():
+                device.locate(index, track.start_point(plan))
+
         try:
+            if control.cancel.is_set():
+                return False
             if link_keep:
                 if bridge is None:
                     raise DeviceError("起停联动需要先打开 Keep 计步窗口。")
-                bridge.check_keep_window()
-            if bridge:
-                bridge.orient(track.travel_path(plan).heading_at(0), immediate=True)
-            if link_keep:
-                device.locate(index, track.start_point(plan))
-                if not monitor.wait_for_start():
+                if not monitor.wait_for_start(position_start):
                     return False
+            elif bridge:
+                bridge.orient(track.travel_path(plan).heading_at(0), immediate=True)
             # LDPlayer emits a stationary fix about a second after its last command.
             # Refresh at 2 Hz so Keep's 1 Hz listener sees successive moving points.
-            if not sensor:
-                control.resume()
-                monitor.start()
-                completed = replay(track, plan, control, send, location_interval=.5, start_clock=False)
-                monitor.check()
-                return completed
             if bridge:
                 total_steps = plan.pacing.at(plan.duration).steps
                 bridge.begin(total_steps)
@@ -231,23 +269,24 @@ def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl
             # Sample the coordinate when the native channel is ready. A queued
             # coordinate arrives late when the previous ldconsole process is slow.
             # The sensor stream shares the start/pause clock and never waits for GPS.
-            control.resume()
             monitor.start()
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="keep-eda-motion") as worker:
-                pulses = worker.submit(replay, track, plan, control, lambda _: None, sensor=sensor,
-                                       location_interval=.5, start_clock=False, on_pulse=pulse_sent)
-                pulses.add_done_callback(lambda f: control.stop() if f.exception() else None)
-                try:
-                    positioned = replay(track, plan, control, send, location_interval=.5, start_clock=False)
-                except BaseException:
-                    control.stop()
-                    raise
-                counted = pulses.result()
-                completed = positioned and counted
-                monitor.check()
-                if completed and bridge:
-                    bridge.finish(total_steps)
-                    control.note_virtual_steps(total_steps)
+            if not sensor:
+                completed = replay(track, plan, control, send, location_interval=.5, start_clock=False)
+            else:
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="keep-eda-motion") as worker:
+                    pulses = worker.submit(replay, track, plan, control, lambda _: None, sensor=sensor,
+                                           location_interval=.5, start_clock=False, on_pulse=pulse_sent)
+                    pulses.add_done_callback(lambda f: control.stop() if f.exception() else None)
+                    try:
+                        positioned = replay(track, plan, control, send, location_interval=.5, start_clock=False)
+                    except BaseException:
+                        control.stop()
+                        raise
+                    counted = pulses.result()
+                    completed = positioned and counted
+                    if completed and bridge:
+                        bridge.finish(total_steps)
+                        control.note_virtual_steps(total_steps)
         except BaseException:
             control.stop()
             raise
@@ -260,4 +299,5 @@ def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl
                 except DeviceError:
                     if not control.cancel.is_set():
                         raise
+        monitor.check()
         return completed

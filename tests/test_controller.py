@@ -11,6 +11,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -19,7 +20,7 @@ from ldplayer import DeviceError, GravityPulse, Instance, KeepWindows, LDPlayer,
 from playback import PlaybackControl, replay, replay_on_device
 from fit_export import export_fit
 from motion import Motion
-from sensor_bridge import VirtualPedometer, open_step_viewer
+from sensor_bridge import VirtualPedometer, locate_start, open_step_viewer
 
 
 class VirtualClock(PlaybackControl):
@@ -259,6 +260,24 @@ class DeviceTests(unittest.TestCase):
                 child.terminate()
                 child.wait(timeout=5)
 
+    def test_fallback_detects_replacement_vm_and_throttles_console_queries(self):
+        device = LDPlayer(Path("ldconsole.exe"))
+        # These invalid PIDs exercise the no-handle path on Windows as well.
+        old = Instance(2, "test", True, 2147483611, 2147483612)
+        new = Instance(2, "test", True, old.pid, 2147483613)
+        now = [100.]
+        with patch.object(device, "instance", side_effect=[old, old, new]) as lookup, \
+             patch("ldplayer.time.monotonic", side_effect=lambda: now[0]), device.watch_instance(2) as check:
+            for stamp in (100.2, 101.1, 101.2, 101.9):
+                now[0] = stamp
+                check()
+            self.assertEqual(lookup.call_count, 2)
+            now[0] = 102.3
+            for _ in range(2):
+                with self.assertRaisesRegex(DeviceError, "重启"):
+                    check()
+            self.assertEqual(lookup.call_count, 3)
+
     def test_list2_chinese_numeric_title_and_legacy_stopped_instance(self):
         devices = parse_list("0,雷电,1,2,526896,2689582,1,47400,6972,1080,1920,480\r\n3,测试,0,0,0,-1,-1\n")
         self.assertEqual((devices[0].name, devices[0].booted, devices[0].pid), ("雷电,1,2", True, 47400))
@@ -285,7 +304,7 @@ class DeviceTests(unittest.TestCase):
         plan = RunPlan.parse("0.05", "5:00", False)
         with self.assertRaisesRegex(DeviceError, "offline"):
             replay_on_device(CampusTrack(), plan, VirtualClock(), device, 7, points.append)
-        self.assertEqual([sample.seconds for sample in points], [i/2 for i in range(10)])
+        self.assertEqual([sample.seconds for sample in points], [0])
         self.assertTrue(all(call.args[0] == 7 for call in device.locate.call_args_list))
         self.assertTrue(all(s.activity_allowed is False for s in points))
         sensor.close.assert_called_once()
@@ -447,7 +466,9 @@ class BridgeTests(unittest.TestCase):
                     command = args[-1]
                     if command == "shell dumpsys activity activities":
                         record = "    topResumedActivity=ActivityRecord{123 u0 com.gotokeep.keep/.Run}\n" if restored else ""
-                        return "Display #4 (activities from top to bottom):\n" + record + "Display #0 (activities from top to bottom):\n"
+                        return ("Display #4 (activities from top to bottom):\n" + record
+                                + "Display #0 (activities from top to bottom):\n"
+                                  "    topResumedActivity=ActivityRecord{125 u0 xyz.keepeda.sensors/.Viewer t9}\n")
                     if command.startswith("shell am start --display 4 "):
                         restored = True
                     if "resolve-activity" in command:
@@ -457,6 +478,63 @@ class BridgeTests(unittest.TestCase):
                 open_step_viewer(device, 0, threading.Event())
                 launches = [call.args[-1] for call in device.command.call_args_list if "--display 4 -n" in call.args[-1]]
                 self.assertEqual(launches, [] if active else ["shell am start --display 4 -n com.gotokeep.keep/.Main"])
+
+    def test_hidden_tasks_and_covered_viewer_are_not_foreground_keep(self):
+        host = ("Display #0 (activities from top to bottom):\n"
+                "  * Task{1 visible=true}\n"
+                "    * Hist  #1: ActivityRecord{1 u0 xyz.keepeda.sensors/.Viewer t4}\n")
+        secondary = ("Display #2 (activities from top to bottom):\n"
+                     "  * Task{2 visible=true}\n"
+                     "    * Hist  #1: ActivityRecord{2 u0 other.app/.Settings t9}\n"
+                     "    * Hist  #0: ActivityRecord{3 u0 com.gotokeep.keep/.MainActivity t9}\n"
+                     "  * Task{3 visible=false}\n"
+                     "    topResumedActivity=ActivityRecord{4 u0 com.gotokeep.keep/.Old t2}\n")
+        windows = KeepWindows.from_activities(host + secondary)
+        self.assertFalse(windows.viewer_has_keep(2))
+        secondary = secondary.replace("other.app/.Settings", "com.gotokeep.keep/.VpOutdoorTrainingActivity")
+        windows = KeepWindows.from_activities(host + secondary)
+        windows.require_viewer(2)
+        self.assertEqual(windows.outdoor_displays, {2})
+        covered = host.replace("xyz.keepeda.sensors/.Viewer", "com.android.launcher/.Home")
+        with self.assertRaisesRegex(DeviceError, "遮住"):
+            KeepWindows.from_activities(covered + secondary).require_viewer(2)
+
+    def test_manual_start_location_protects_an_active_virtual_workout(self):
+        for state in ("RUNNING", "PAUSED", "READY"):
+            with self.subTest(state=state):
+                device, bridge = Mock(), Mock()
+                device.keep_windows.return_value = KeepWindows({0:False, 2:True}, False, True, frozenset({2}))
+                bridge.display_id, bridge.keep_state.return_value = 2, state
+                with patch("sensor_bridge.VirtualPedometer.connect", return_value=bridge):
+                    def position():
+                        locate_start(device, 0, (121.8, 39.1), 90, threading.Event(), motion=True, linked=True)
+                    if state == "READY":
+                        position()
+                        device.locate.assert_called_once()
+                        bridge.orient.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(DeviceError, "当前运动"):
+                            position()
+                        device.locate.assert_not_called()
+                        bridge.orient.assert_not_called()
+                bridge.close.assert_called_once()
+
+    def test_ordinary_outdoor_stack_in_line_trimmed_ldplayer_diagnostic(self):
+        ordinary = ("Display #0 (activities from top to bottom):\n"
+                    "* Task{abc #7 visible=true visibleRequested=true sz=2}\n"
+                    "mLastPausedActivity: ActivityRecord{a u0 com.gotokeep.keep/.VpOutdoorTrainingActivity t7}\n"
+                    "topResumedActivity=ActivityRecord{a u0 com.gotokeep.keep/.VpOutdoorTrainingActivity t7}\n"
+                    "* Task{def #8 visible=false visibleRequested=false sz=1}\n"
+                    "* Hist  #0: ActivityRecord{b u0 xyz.keepeda.sensors/.Viewer t8}\n"
+                    "Display #2 (activities from top to bottom):\n"
+                    "ResumedActivity: ActivityRecord{a u0 com.gotokeep.keep/.VpOutdoorTrainingActivity t7}\n"
+                    "* Task{abc #7 visible=true}\n"
+                    "* Hist  #1: ActivityRecord{a u0 com.gotokeep.keep/.VpOutdoorTrainingActivity t7}\n")
+        result = KeepWindows.from_activities(ordinary)
+        self.assertEqual(result.has_keep, {0:True, 2:False})
+        self.assertFalse(result.viewer_visible)
+        with self.assertRaisesRegex(DeviceError, "普通窗口"):
+            result.require_viewer(2)
 
     def test_regular_workout_and_global_summary_cannot_start_linked_replay(self):
         dump = ("Display #0 (activities from top to bottom):\n"
@@ -489,7 +567,7 @@ class BridgeTests(unittest.TestCase):
         for existing in (False, True):
             with self.subTest(existing=existing):
                 device = Mock(spec=LDPlayer)
-                empty = KeepWindows({0:True, 2:False}, False)
+                empty = KeepWindows({0:True, 2:False}, False, viewer_visible=False)
                 wrong = KeepWindows({0:True, 2:False}, True)
                 device.keep_windows.side_effect = [empty, empty, wrong]
                 bridge = Mock(spec=VirtualPedometer)
@@ -510,6 +588,18 @@ class BridgeTests(unittest.TestCase):
                         open_step_viewer(device, 0, threading.Event(), heading=90)
                 bridge.close.assert_called_once()
                 bridge.orient.assert_not_called()
+
+    def test_unresponsive_open_viewer_is_preserved(self):
+        device = Mock(spec=LDPlayer)
+        device.keep_windows.return_value = KeepWindows({0:False, 2:True}, False)
+        device.command.side_effect = ["34", "package:/base.apk"]
+        with patch("sensor_bridge.VirtualPedometer.connect", return_value=None) as connect, \
+             patch("sensor_bridge._start_step_bridge") as start:
+            with self.assertRaisesRegex(DeviceError, "已有计步窗口"):
+                open_step_viewer(device, 0, threading.Event())
+        self.assertEqual(connect.call_count, 2)
+        start.assert_not_called()
+        self.assertEqual(device.command.call_count, 2)
 
     @patch("sensor_bridge.VirtualPedometer.connect")
     def test_successful_launch_that_leaves_viewer_empty_times_out(self, connect):
@@ -592,6 +682,73 @@ class ExportTests(unittest.TestCase):
 
 
 class DashboardTests(unittest.TestCase):
+    def destroy_dashboard(self, root):
+        # The test suite creates several Tk roots in the same process.
+        for callback in root.tk.call("after", "info"):
+            root.after_cancel(callback)
+        root.destroy()
+
+    def test_linked_run_from_desktop_buttons_to_final_history(self):
+        import tkinter as tk
+        from app import Dashboard
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(str(error))
+        root.withdraw()
+        def pump_until(predicate, timeout=4):
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                root.update()
+                if predicate():
+                    return True
+                time.sleep(.01)
+            return False
+        device, bridge = Mock(spec=LDPlayer), Mock(spec=VirtualPedometer)
+        device.reserve_location.return_value = nullcontext()
+        device.watch_instance.return_value = nullcontext(lambda: None)
+        state = ["READY"]
+        actions = []
+        bridge.keep_state.side_effect = lambda: state[0]
+        def act(action):
+            actions.append(action)
+            if actions == ["PAUSE", "RESUME", "PAUSE"]:
+                state[0] = "PAUSED"  # Acknowledge the automatic final pause.
+        bridge.keep_action.side_effect = act
+        with TemporaryDirectory() as folder, patch("app.find_console", return_value=None), \
+             patch("app.LDPlayer", return_value=device), patch("playback.VirtualPedometer.connect", return_value=bridge):
+            dash = Dashboard(root, Path(folder, "settings.json"))
+            try:
+                dash.console = Path("ldconsole.exe")
+                dash.km.set("0.010")
+                dash.pace.set("3:00")
+                dash.start_run(False)
+                self.assertTrue(pump_until(lambda: "现在可以" in dash.status.get()))
+                self.assertEqual(dash.stop_button.cget("text"), "取消等待")
+                state[0] = "RUNNING"
+                self.assertTrue(pump_until(lambda: dash.has_sample))
+                dash.pause_button.invoke()
+                self.assertEqual(dash.pause_button.cget("text"), "正在暂停…")
+                self.assertEqual(dash.pause_button.cget("state"), "disabled")
+                dash.pause_button.invoke()
+                self.assertTrue(pump_until(lambda: actions == ["PAUSE"]))
+                state[0] = "PAUSED"
+                self.assertTrue(pump_until(lambda: dash.pause_button.cget("text") == "继续"))
+                dash.pause_button.invoke()
+                self.assertTrue(pump_until(lambda: actions == ["PAUSE", "RESUME"]))
+                self.assertTrue(dash.control.paused)
+                state[0] = "RUNNING"
+                self.assertTrue(pump_until(lambda: dash.pause_button.cget("text") == "暂停"))
+                self.assertTrue(pump_until(lambda: not dash.job, timeout=6))
+                self.assertIn("Keep 已自动暂停", dash.status.get())
+                saved = json.loads(dash.last_replay_path(0).read_bytes())
+                self.assertEqual((saved["state"], saved["location_m"]), ("到达目标", 10))
+                self.assertEqual(saved["steps_sent"], dash.plan.pacing.at(dash.plan.duration).steps)
+                bridge.close.assert_called_once()
+            finally:
+                dash.control.stop()
+                self.destroy_dashboard(root)
+
     def test_default_route_distance_and_source_tab_with_old_preferences(self):
         import tkinter as tk
         from app import Dashboard
@@ -611,9 +768,10 @@ class DashboardTests(unittest.TestCase):
                 self.assertTrue(dash.motion_enabled.get())
                 self.assertTrue(dash.random_start.get())
                 self.assertEqual(dash.map.start, dash.track.start_point(dash.plan))
-                with patch("app.LDPlayer") as factory, patch.object(
+                with patch("app.LDPlayer") as factory, patch("sensor_bridge.VirtualPedometer.connect", return_value=None), patch.object(
                     dash, "task", side_effect=lambda kind, msg, work: work(PlaybackControl())
                 ):
+                    factory.return_value.keep_windows.return_value = KeepWindows({0:False}, False)
                     dash.device_action("locate")
                     factory.return_value.locate.assert_called_once_with(0, dash.map.start)
                 dash.random_start.set(False)
@@ -630,7 +788,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertNotIn("km", json.loads(prefs.read_text(encoding="utf-8")))
                 self.assertFalse(json.loads(prefs.read_text(encoding="utf-8"))["random_start"])
         finally:
-            root.destroy()
+            self.destroy_dashboard(root)
 
 
 if __name__ == "__main__":
