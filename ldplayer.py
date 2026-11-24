@@ -154,6 +154,45 @@ class Instance:
         return f"{self.index} · {self.name}（{state}）"
 
 
+@dataclass(frozen=True)
+class KeepWindows:
+    has_keep: dict[int, bool]
+    outdoor_on_primary: bool
+
+    @classmethod
+    def from_activities(cls, dump: str) -> "KeepWindows":
+        # The global ResumedActivity and supervisor summary repeat other displays' tasks.
+        blocks = re.findall(r"(?ms)^Display #(\d+) \(activities[^\n]*\n(.*?)(?=^\S|^  ResumedActivity:|\Z)", dump)
+        has_keep = {}
+        outdoor = False
+        for number, block in blocks:
+            records = re.findall(
+                rf"(?m)^[ \t]*(topResumedActivity=|\*[ \t]+Hist[ \t]+#\d+:[ \t]*)ActivityRecord\{{"
+                rf"[^\n}}]*?\bu\d+\s+{re.escape(KEEP_PACKAGE)}/([\w.$]+)", block)
+            display_id = int(number)
+            has_keep[display_id] = bool(records)
+            if display_id == 0:
+                outdoor = any(kind == "topResumedActivity=" and name.endswith(".VpOutdoorTrainingActivity")
+                              for kind, name in records)
+        if 0 not in has_keep:
+            raise DeviceError("无法确认 Keep 所在的窗口。请确认雷电已解锁，再重试。")
+        return cls(has_keep, outdoor)
+
+    def check_primary(self) -> None:
+        if self.outdoor_on_primary:
+            raise DeviceError("户外跑步页在雷电普通窗口。请先处理那里的运动并返回 Keep 首页，再点「打开 Keep 计步窗口」。")
+
+    def viewer_has_keep(self, display_id: int) -> bool:
+        self.check_primary()
+        if display_id <= 0 or display_id not in self.has_keep:
+            raise DeviceError("计步窗口已断开。请重新打开 Keep 计步窗口。")
+        return self.has_keep[display_id]
+
+    def require_viewer(self, display_id: int) -> None:
+        if not self.viewer_has_keep(display_id):
+            raise DeviceError("Keep 未进入计步窗口。请点「打开 Keep 计步窗口」，在底部有「关闭计步窗口」的页面继续。")
+
+
 def parse_list(output: str) -> list[Instance]:
     instances = []
     for raw in output.splitlines():
@@ -204,8 +243,8 @@ class LDPlayer:
             raise DeviceError("无法为此实例预留定位接口。")
         try:
             if already_open:
-                raise DeviceError(f"实例 {index} 的定位正被其他控制台占用。请等原窗口完成定位或打开计步窗口，"
-                                  "如在等待 GO 或回放中，请在原窗口点「结束」。")
+                raise DeviceError(f"实例 {index} 的定位正被其他控制台占用。请等原窗口完成准备，"
+                                  "或在原窗口点「取消等待」或「结束」。")
             yield
         finally:
             kernel.CloseHandle(handle)
@@ -238,6 +277,10 @@ class LDPlayer:
 
     def instances(self) -> list[Instance]:
         return parse_list(self.command("list2"))
+
+    def keep_windows(self, index: int) -> KeepWindows:
+        dump = self.command("adb", "--index", str(index), "--command", "shell dumpsys activity activities", timeout=5)
+        return KeepWindows.from_activities(dump)
 
     def instance(self, index: int) -> Instance:
         for device in self.instances():

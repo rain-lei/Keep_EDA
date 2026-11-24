@@ -27,7 +27,7 @@ from sensor_bridge import open_step_viewer, orient_step_viewer
 
 BACKGROUND, PAPER, LIGHT, MUTED = "#f4f6f2", "#ffffff", "#eaf0e9", "#536a5e"
 SETTINGS = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "KeepEDA" / "settings.json"
-INITIAL_HINT = "打开 Keep 计步窗口，点「实时回放」待命，再在 Keep 开始户外跑步；默认自动联动起停。"
+INITIAL_HINT = "打开 Keep 计步窗口，点「实时回放」待命，再在底部有「关闭计步窗口」的 Keep 页面点 GO。"
 PERMISSION_HINT = "Keep 的「身体活动」权限已关闭。可在 Android 的「应用 → Keep → 权限」中允许身体活动。"
 
 
@@ -324,7 +324,9 @@ class Dashboard:
             self.stop_button.grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=(0, 5))
             self.pause_button.configure(text="继续" if self.paused else "暂停",
                                        state="normal" if self.has_sample and not self.control.cancel.is_set() else "disabled")
-            self.stop_button.configure(state="disabled" if self.control.cancel.is_set() else "normal")
+            waiting = self.job == "live" and self.linking and not self.has_sample
+            self.stop_button.configure(text="取消等待" if waiting else "结束",
+                                       state="disabled" if self.control.cancel.is_set() else "normal")
         else:
             self.pause_button.grid_remove()
             self.stop_button.grid_remove()
@@ -416,6 +418,7 @@ class Dashboard:
         start = self.track.start_point(self.plan) if self.plan else None
         heading = self.track.travel_path(self.plan).heading_at(0) if self.plan else None
         check_motion = self.motion_enabled.get()
+        linked = check_motion and self.link_enabled.get()
 
         def action(control):
             if not device.prepare(index, control.cancel):
@@ -431,6 +434,8 @@ class Dashboard:
             if start is None:
                 raise ValueError("请先填写有效的跑步距离和配速。")
             with device.reserve_location(index):
+                if linked:
+                    device.keep_windows(index).check_primary()
                 device.check_location(index)
                 device.locate(index, start)
                 if check_motion:
@@ -522,7 +527,7 @@ class Dashboard:
     def stop(self) -> None:
         self.control.stop()
         self.update_controls()
-        self.tell("正在结束回放…")
+        self.tell("正在取消等待…" if self.job == "live" and self.linking and not self.has_sample else "正在结束回放…")
 
     def save_fit(self) -> None:
         plan = self.plan

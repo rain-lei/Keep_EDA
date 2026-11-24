@@ -206,11 +206,13 @@ def replay_on_device(track: CampusTrack, plan: RunPlan, control: PlaybackControl
                 control.note_virtual_steps(steps)
             monitor.stepped()
         try:
-            if bridge:
-                bridge.orient(track.travel_path(plan).heading_at(0), immediate=True)
             if link_keep:
                 if bridge is None:
                     raise DeviceError("起停联动需要先打开 Keep 计步窗口。")
+                bridge.check_keep_window()
+            if bridge:
+                bridge.orient(track.travel_path(plan).heading_at(0), immediate=True)
+            if link_keep:
                 device.locate(index, track.start_point(plan))
                 if not monitor.wait_for_start():
                     return False

@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from campus import CampusTrack, RunPlan, distance_m
-from ldplayer import DeviceError, GravityPulse, Instance, LDPlayer, parse_list
+from ldplayer import DeviceError, GravityPulse, Instance, KeepWindows, LDPlayer, parse_list
 from playback import PlaybackControl, replay, replay_on_device
 from fit_export import export_fit
 from motion import Motion
@@ -439,20 +439,95 @@ class BridgeTests(unittest.TestCase):
         connect.return_value.display_id = 4
         for active in (True, False):
             with self.subTest(active=active):
-                device = Mock(spec=LDPlayer)
-                record = "    topResumedActivity=ActivityRecord{123 u0 com.gotokeep.keep/.Run}\n" if active else ""
-                tasks = "Display #4 (activities from top to bottom):\n" + record + "Display #0 (activities from top to bottom):\n"
-                replies = {"shell getprop ro.build.version.sdk": "34", f"shell pm path {package}": "package:/data/app/base.apk",
-                           "shell dumpsys activity activities": tasks}
+                device = LDPlayer(Path("ldconsole.exe"))
+                restored = active
+                replies = {"shell getprop ro.build.version.sdk": "34", f"shell pm path {package}": "package:/data/app/base.apk"}
                 def android(*args, **kwargs):
+                    nonlocal restored
                     command = args[-1]
+                    if command == "shell dumpsys activity activities":
+                        record = "    topResumedActivity=ActivityRecord{123 u0 com.gotokeep.keep/.Run}\n" if restored else ""
+                        return "Display #4 (activities from top to bottom):\n" + record + "Display #0 (activities from top to bottom):\n"
+                    if command.startswith("shell am start --display 4 "):
+                        restored = True
                     if "resolve-activity" in command:
                         return package + "/.Main"
                     return replies.get(command,"")
-                device.command.side_effect = android
+                device.command = Mock(side_effect=android)
                 open_step_viewer(device, 0, threading.Event())
                 launches = [call.args[-1] for call in device.command.call_args_list if "--display 4 -n" in call.args[-1]]
                 self.assertEqual(launches, [] if active else ["shell am start --display 4 -n com.gotokeep.keep/.Main"])
+
+    def test_regular_workout_and_global_summary_cannot_start_linked_replay(self):
+        dump = ("Display #0 (activities from top to bottom):\n"
+                "    topResumedActivity=ActivityRecord{123 u0 com.gotokeep.keep/.training.VpOutdoorTrainingActivity t7}\n"
+                "Display #2 (activities from top to bottom):\n"
+                "  ResumedActivity: ActivityRecord{123 u0 com.gotokeep.keep/.training.VpOutdoorTrainingActivity t7}\n"
+                "ActivityTaskSupervisor state:\n"
+                "    * Hist  #1: ActivityRecord{123 u0 com.gotokeep.keep/.training.VpOutdoorTrainingActivity t7}")
+        windows = KeepWindows.from_activities(dump)
+        self.assertEqual(windows.has_keep, {0:True, 2:False})
+        device = Mock(spec=LDPlayer)
+        device.keep_windows.return_value = windows
+        device.reserve_location.return_value = nullcontext()
+        device.watch_instance.return_value = nullcontext(lambda: None)
+        bridge = Mock(spec=VirtualPedometer)
+        bridge.check_keep_window.side_effect = lambda: windows.require_viewer(2)
+        with patch("playback.VirtualPedometer.connect", return_value=bridge):
+            with self.assertRaisesRegex(DeviceError, "户外跑步页在雷电普通窗口"):
+                replay_on_device(CampusTrack(), RunPlan(10, 120, False, 17), PlaybackControl(),
+                                 device, 0, lambda _: None, link_keep=True)
+        device.locate.assert_not_called()
+        bridge.orient.assert_not_called()
+        bridge.begin.assert_not_called()
+        bridge.keep_action.assert_not_called()
+        bridge.close.assert_called_once()
+        with self.assertRaisesRegex(DeviceError, "无法确认"):
+            KeepWindows.from_activities("no display sections")
+
+    def test_cold_and_warm_viewer_never_report_ready_for_misdirected_launch(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                device = Mock(spec=LDPlayer)
+                empty = KeepWindows({0:True, 2:False}, False)
+                wrong = KeepWindows({0:True, 2:False}, True)
+                device.keep_windows.side_effect = [empty, empty, wrong]
+                bridge = Mock(spec=VirtualPedometer)
+                bridge.display_id = 2
+                def adb(*args, **kwargs):
+                    command = args[-1]
+                    if command == "shell getprop ro.build.version.sdk":
+                        return "34"
+                    if "pm path" in command:
+                        return "package:/data/app/base.apk"
+                    if "resolve-activity" in command:
+                        return "com.gotokeep.keep/.Main"
+                    return "Status: ok"
+                device.command.side_effect = adb
+                with patch("sensor_bridge.VirtualPedometer.connect", return_value=bridge if existing else None), \
+                     patch("sensor_bridge._start_step_bridge", return_value=bridge):
+                    with self.assertRaisesRegex(DeviceError, "户外跑步页在雷电普通窗口"):
+                        open_step_viewer(device, 0, threading.Event(), heading=90)
+                bridge.close.assert_called_once()
+                bridge.orient.assert_not_called()
+
+    @patch("sensor_bridge.VirtualPedometer.connect")
+    def test_successful_launch_that_leaves_viewer_empty_times_out(self, connect):
+        device = Mock(spec=LDPlayer)
+        device.keep_windows.return_value = KeepWindows({0:True, 2:False}, False)
+        connect.return_value.display_id = 2
+        replies = {"shell getprop ro.build.version.sdk":"34", "shell pm path com.gotokeep.keep":"package:/base.apk"}
+        def adb(*args, **kwargs):
+            if "resolve-activity" in args[-1]:
+                return "com.gotokeep.keep/.Main"
+            return replies.get(args[-1], "Status: ok")
+        device.command.side_effect = adb
+        with patch("sensor_bridge.time") as clock:
+            clock.monotonic.side_effect = [100, 105]
+            with self.assertRaisesRegex(DeviceError, "Keep 未进入计步窗口"):
+                open_step_viewer(device, 0, threading.Event(), heading=90)
+        connect.return_value.orient.assert_not_called()
+        connect.return_value.close.assert_called_once()
 
 
 class ExportTests(unittest.TestCase):

@@ -24,9 +24,16 @@ class RunMonitor:
         self.last_step = time.monotonic()
 
     def wait_for_start(self) -> bool:
-        self.status("waiting", "等待 Keep 开始户外跑步；倒计时结束后会自动回放。")
+        self.status("waiting", "请在底部有「关闭计步窗口」的 Keep 页面开始户外跑步。倒计时结束后会自动回放。")
+        next_window_check = time.monotonic() + 3
         while not self.control.cancel.is_set():
-            if self.bridge.keep_state() == "RUNNING":
+            state = self.bridge.keep_state()
+            if state == "RUNNING" or time.monotonic() >= next_window_check:
+                self.bridge.check_keep_window()
+                next_window_check = time.monotonic() + 3
+            if self.control.cancel.is_set():
+                return False
+            if state == "RUNNING":
                 self.started = True
                 return True
             self.control.cancel.wait(.2)

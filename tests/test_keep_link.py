@@ -1,7 +1,7 @@
 from threading import Thread
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import json
 import time
 import unittest
@@ -27,6 +27,7 @@ class KeepState:
 
     def __init__(self):
         self.actions = []
+        self.check_keep_window = Mock()
 
     def keep_state(self):
         return self.state
@@ -121,6 +122,21 @@ class LinkTests(unittest.TestCase):
         self.assertFalse(monitor.wait_for_start())
         monitor.close()
         self.assertEqual(bridge.actions,[])
+
+    def test_wrong_window_while_waiting_exits_without_touching_keep(self):
+        for state in ("UNKNOWN", "RUNNING"):
+            with self.subTest(state=state):
+                bridge = KeepState()
+                bridge.state = state
+                bridge.check_keep_window.side_effect = DeviceError("户外跑步页在雷电普通窗口")
+                monitor = RunMonitor(PlaybackControl(), bridge)
+                with patch("keep_link.time") as clock:
+                    clock.monotonic.side_effect = [0, 4]
+                    with self.assertRaisesRegex(DeviceError, "普通窗口"):
+                        monitor.wait_for_start()
+                monitor.close()
+                self.assertFalse(monitor.started)
+                self.assertEqual(bridge.actions, [])
 
 
 if __name__ == "__main__":
